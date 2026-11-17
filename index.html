@@ -68,6 +68,14 @@
       return { titles, ti, title, scenes, si, scene: scenes[si] || {} };
     }
 
+    function sendState(st, reason) {
+      if (!st) return;
+      try {
+        context.sendCustomMessage(NAMESPACE, undefined, st);
+        console.log('[cue-receiver] sent', reason, st.seq, st.origin, st.positionMs);
+      } catch (e) { console.warn('[cue-receiver] send failed', e); }
+    }
+
     function applyState(st, reason) {
       if (!st || typeof st !== 'object') return;
       if (st.seq != null && st.seq < seq && reason !== 'force') return;
@@ -79,13 +87,6 @@
         (cur.titles.length ? `  ·  ${cur.ti + 1}/${cur.titles.length}` : '');
       showPlaying();
       console.log('[cue-receiver] apply', reason, st.seq, cur.title.ratingKey, cur.scene.startMs, st.positionMs);
-      // Broadcast MediaStatus-shaped customData so the phone can converge.
-      try {
-        const status = playerManager.getMediaInformation() || {};
-        if (status) {
-          // CAF keeps media customData from LOAD; custom messages carry full playlist.
-        }
-      } catch (e) {}
     }
 
     function bump(deltaTitle, deltaScene) {
@@ -111,15 +112,18 @@
         playing: true,
       });
       applyState(next, 'nav');
-      try {
-        context.sendCustomMessage(NAMESPACE, undefined, next);
-      } catch (e) { console.warn(e); }
+      sendState(next, 'nav');
     }
 
     playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, loadRequestData => {
       const custom = loadRequestData.customData ||
         (loadRequestData.media && loadRequestData.media.customData) || null;
-      if (custom) applyState(custom, 'LOAD');
+      if (custom) {
+        applyState(custom, 'LOAD');
+        // Keep ShortsCastState on media so MediaStatus.customData reaches the phone.
+        loadRequestData.customData = custom;
+        if (loadRequestData.media) loadRequestData.media.customData = custom;
+      }
       return loadRequestData;
     });
 
@@ -128,9 +132,24 @@
     });
 
     playerManager.addEventListener(cast.framework.events.EventType.MEDIA_FINISHED, () => bump(0, 1));
+    // Play/pause changes → phone (seq bump). Position streams via MediaStatus / RemoteMediaClient.
     playerManager.addEventListener(cast.framework.events.EventType.MEDIA_STATUS, () => {
-      // Keep overlay in sync if CAF advances.
-      if (state) applyState(state, 'status');
+      if (!state) return;
+      try {
+        const pos = playerManager.getCurrentTimeSec();
+        const playing = playerManager.getPlayerState() === cast.framework.messages.PlayerState.PLAYING;
+        const posMs = (typeof pos === 'number' && !isNaN(pos)) ? Math.round(pos * 1000) : (state.positionMs || 0);
+        if (!!playing === !!state.playing && Math.abs(posMs - (state.positionMs || 0)) < 800) return;
+        const playChanged = !!playing !== !!state.playing;
+        const next = Object.assign({}, state, {
+          seq: playChanged ? (state.seq || 0) + 1 : (state.seq || 0),
+          origin: 'web',
+          positionMs: posMs,
+          playing: !!playing,
+        });
+        state = next;
+        if (playChanged) { seq = next.seq; sendState(next, 'play-state'); }
+      } catch (e) {}
     });
 
     document.addEventListener('keydown', e => {
