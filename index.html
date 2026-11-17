@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cue Shorts Receiver</title>
+  <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; height: 100%; background: #0b0b0d; overflow: hidden; font-family: "Google Sans", system-ui, sans-serif; }
+    #stage { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #0b0b0d; }
+    video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+    #overlay {
+      position: absolute; left: 0; right: 0; bottom: 0;
+      padding: 48px 56px 64px;
+      background: linear-gradient(transparent, rgba(0,0,0,.85));
+      pointer-events: none;
+    }
+    #title { font-size: 42px; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 8px; color: #fff; }
+    #meta { font-size: 22px; opacity: .75; margin: 0; color: #fff; }
+    #idle {
+      position: absolute; inset: 0; display: grid; place-items: center;
+      color: #f2f2f2; text-align: center;
+    }
+    #idle h1 { font-size: 64px; margin: 0 0 12px; letter-spacing: -0.03em; }
+    #idle p { font-size: 24px; opacity: .65; margin: 0; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div id="idle">
+    <div>
+      <h1>Cue</h1>
+      <p>Waiting for Shorts from your phone…</p>
+    </div>
+  </div>
+  <div id="stage" class="hidden">
+    <video id="player" playsinline></video>
+    <div id="overlay">
+      <p id="title"></p>
+      <p id="meta"></p>
+    </div>
+  </div>
+  <script>
+    const NAMESPACE = 'urn:x-cast:com.efraimbart.cue.shorts';
+    const context = cast.framework.CastReceiverContext.getInstance();
+    const playerManager = context.getPlayerManager();
+    const video = document.getElementById('player');
+    const idle = document.getElementById('idle');
+    const stage = document.getElementById('stage');
+    const titleEl = document.getElementById('title');
+    const metaEl = document.getElementById('meta');
+
+    let state = null;
+    let seq = 0;
+
+    function showPlaying() {
+      idle.classList.add('hidden');
+      stage.classList.remove('hidden');
+    }
+
+    function currentScene(st) {
+      const titles = st.titles || [];
+      const ti = Math.max(0, Math.min(st.titleIndex || 0, Math.max(0, titles.length - 1)));
+      const title = titles[ti] || {};
+      const scenes = title.scenes || [];
+      const si = Math.max(0, Math.min(st.sceneIndex || 0, Math.max(0, scenes.length - 1)));
+      return { titles, ti, title, scenes, si, scene: scenes[si] || {} };
+    }
+
+    function applyState(st, reason) {
+      if (!st || typeof st !== 'object') return;
+      if (st.seq != null && st.seq < seq && reason !== 'force') return;
+      seq = st.seq || seq;
+      state = st;
+      const cur = currentScene(st);
+      titleEl.textContent = cur.title.title || 'Cue Shorts';
+      metaEl.textContent = (cur.scene.description || cur.scene.title || '') +
+        (cur.titles.length ? `  ·  ${cur.ti + 1}/${cur.titles.length}` : '');
+      showPlaying();
+      console.log('[cue-receiver] apply', reason, st.seq, cur.title.ratingKey, cur.scene.startMs, st.positionMs);
+      // Broadcast MediaStatus-shaped customData so the phone can converge.
+      try {
+        const status = playerManager.getMediaInformation() || {};
+        if (status) {
+          // CAF keeps media customData from LOAD; custom messages carry full playlist.
+        }
+      } catch (e) {}
+    }
+
+    function bump(deltaTitle, deltaScene) {
+      if (!state || !state.titles || !state.titles.length) return;
+      let ti = state.titleIndex || 0;
+      let si = state.sceneIndex || 0;
+      const scenes = (state.titles[ti] && state.titles[ti].scenes) || [];
+      if (deltaScene) {
+        si += deltaScene;
+        if (si >= scenes.length) { ti = Math.min(ti + 1, state.titles.length - 1); si = 0; }
+        if (si < 0) { ti = Math.max(ti - 1, 0); si = Math.max(0, ((state.titles[ti].scenes || []).length - 1)); }
+      }
+      if (deltaTitle) {
+        ti = Math.max(0, Math.min(ti + deltaTitle, state.titles.length - 1));
+        si = 0;
+      }
+      const next = Object.assign({}, state, {
+        seq: (state.seq || 0) + 1,
+        origin: 'web',
+        titleIndex: ti,
+        sceneIndex: si,
+        positionMs: (((state.titles[ti] || {}).scenes || [])[si] || {}).startMs || 0,
+        playing: true,
+      });
+      applyState(next, 'nav');
+      try {
+        context.sendCustomMessage(NAMESPACE, undefined, next);
+      } catch (e) { console.warn(e); }
+    }
+
+    playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, loadRequestData => {
+      const custom = loadRequestData.customData ||
+        (loadRequestData.media && loadRequestData.media.customData) || null;
+      if (custom) applyState(custom, 'LOAD');
+      return loadRequestData;
+    });
+
+    context.addCustomMessageListener(NAMESPACE, event => {
+      applyState(event.data, 'custom');
+    });
+
+    playerManager.addEventListener(cast.framework.events.EventType.MEDIA_FINISHED, () => bump(0, 1));
+    playerManager.addEventListener(cast.framework.events.EventType.MEDIA_STATUS, () => {
+      // Keep overlay in sync if CAF advances.
+      if (state) applyState(state, 'status');
+    });
+
+    document.addEventListener('keydown', e => {
+      if (e.key === 'ArrowDown' || e.key === 'MediaTrackNext') bump(1, 0);
+      if (e.key === 'ArrowUp' || e.key === 'MediaTrackPrevious') bump(-1, 0);
+      if (e.key === 'ArrowRight') bump(0, 1);
+      if (e.key === 'ArrowLeft') bump(0, -1);
+    });
+
+    const options = new cast.framework.CastReceiverOptions();
+    options.customNamespaces = Object.assign({}, options.customNamespaces || {}, {
+      [NAMESPACE]: cast.framework.system.MessageType.JSON
+    });
+    options.maxInactivity = 3600;
+    context.start(options);
+    console.log('[cue-receiver] started App ID 30917C87 Shorts CAF');
+  </script>
+</body>
+</html>
