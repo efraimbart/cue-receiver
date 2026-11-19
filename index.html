@@ -131,8 +131,9 @@
 <body>
   <div id="root">
     <div id="art" aria-hidden="true"></div>
-    <!-- Bound to CAF via playerManager.setMediaElement — not an orphaned video. -->
-    <video id="media" playsinline crossorigin="anonymous"></video>
+    <!-- Bound to CAF via playerManager.setMediaElement.
+         No crossorigin: progressive <video src> must NOT force CORS (CORS only blocks Shaka/MSE/HLS fetch). -->
+    <video id="media" playsinline></video>
 
     <div id="idle">
       <div>
@@ -177,7 +178,13 @@
     STATUS: 'status',
     MEDIA_ERROR: 'mediaError',
     RESYNC: 'resync',
+    CAF_PLAY: 'cafPlay',
   };
+
+  // v3.5.60 progressive ladder: 1=direct part, 2=HTTP MP4 remux, 3=HLS (disabled until CORS fix).
+  const HLS_ENABLED = false;
+  const DEFAULT_STALL_MS = 8000;
+  let ladder = null; // { clipId, steps, idx, startedAt, reported, meta, stallTimer, loadGen }
 
   const el = {
     media: document.getElementById('media'),
@@ -655,11 +662,16 @@
     catch (e) { console.warn('[cue-receiver] pause failed', e); }
   }
 
-  function guessMime(url) {
+  function guessMime(url, container, step) {
+    if (step === 2) return 'video/mp4';
+    if (step === 3) return 'application/x-mpegurl';
+    const c = String(container || '').toLowerCase();
     const u = String(url || '').toLowerCase();
+    if (c.indexOf('webm') >= 0 || u.indexOf('.webm') >= 0) return 'video/webm';
+    if (c.indexOf('mkv') >= 0 || c.indexOf('matroska') >= 0 || u.indexOf('.mkv') >= 0) return 'video/x-matroska';
+    if (c.indexOf('mp4') >= 0 || u.indexOf('.mp4') >= 0 || u.indexOf('start.mp4') >= 0) return 'video/mp4';
     if (u.indexOf('.m3u8') >= 0) return 'application/x-mpegurl';
     if (u.indexOf('.mpd') >= 0) return 'application/dash+xml';
-    if (u.indexOf('.webm') >= 0) return 'video/webm';
     return 'video/mp4';
   }
 
@@ -667,48 +679,193 @@
     return rx.status ? Object.assign({}, rx.status) : null;
   }
 
-  function buildLoadRequest(url, startMs, autoplay, customData) {
+  function clearLadderTimer() {
+    if (ladder && ladder.stallTimer) {
+      clearTimeout(ladder.stallTimer);
+      ladder.stallTimer = null;
+    }
+  }
+
+  function emitCafPlay(step, result, ttffMs, contentType) {
+    if (!ladder || ladder.reported) return;
+    ladder.reported = true;
+    clearLadderTimer();
+    const meta = ladder.meta || {};
+    const payload = {
+      v: 2,
+      type: TYPE.CAF_PLAY,
+      epoch: rx.epoch,
+      seq: nextOutSeq(),
+      origin: SELF,
+      clipId: ladder.clipId || (rx.status && rx.status.clipId) || '',
+      step: step,
+      result: result,
+      ttffMs: ttffMs == null ? -1 : ttffMs,
+      container: meta.container || '',
+      videoCodec: meta.videoCodec || '',
+      audioCodec: meta.audioCodec || '',
+      width: meta.width || 0,
+      height: meta.height || 0,
+      contentType: contentType || '',
+      deviceModel: (cast && cast.__platform__) || 'chromecast',
+    };
+    try {
+      context.sendCustomMessage(NAMESPACE, undefined, payload);
+      console.log('[cue-receiver] cafPlay', payload.clipId, 'step=' + step, result, 'ttff=' + payload.ttffMs);
+    } catch (e) {
+      console.warn('[cue-receiver] cafPlay send failed', e);
+    }
+  }
+
+  function buildStepsFromCustom(custom, fallbackUrl) {
+    const meta = {
+      container: String((custom && custom.container) || ''),
+      videoCodec: String((custom && custom.videoCodec) || ''),
+      audioCodec: String((custom && custom.audioCodec) || ''),
+      width: Number((custom && custom.width) || 0) || 0,
+      height: Number((custom && custom.height) || 0) || 0,
+      stallMs: Number((custom && custom.stallMs) || DEFAULT_STALL_MS) || DEFAULT_STALL_MS,
+    };
+    const preferred = Number((custom && custom.preferredStep) || 1) || 1;
+    const hlsEnabled = !!(custom && custom.hlsEnabled) && HLS_ENABLED;
+    const direct = isHttpUrl(custom && custom.directUrl) ? custom.directUrl
+      : (isHttpUrl(custom && custom.streamUrl) ? custom.streamUrl : fallbackUrl);
+    const remux = isHttpUrl(custom && custom.remuxUrl) ? custom.remuxUrl : '';
+    const hls = hlsEnabled && isHttpUrl(custom && custom.hlsUrl) ? custom.hlsUrl : '';
+    const steps = [];
+    function add(step, url) {
+      if (!isHttpUrl(url)) return;
+      if (steps.some(function (s) { return s.url === url; })) return;
+      steps.push({
+        step: step,
+        url: url,
+        contentType: guessMime(url, meta.container, step),
+      });
+    }
+    // Prefer remembered step first, then the rest of the ladder.
+    if (preferred === 2) { add(2, remux); add(1, direct); }
+    else if (preferred === 3 && hlsEnabled) { add(3, hls); add(1, direct); add(2, remux); }
+    else { add(1, direct); add(2, remux); }
+    if (hlsEnabled) add(3, hls);
+    if (!steps.length && isHttpUrl(fallbackUrl)) {
+      add(1, fallbackUrl);
+    }
+    return { steps: steps, meta: meta };
+  }
+
+  function buildLoadRequest(url, startMs, autoplay, customData, contentType) {
     const mediaInfo = new cast.framework.messages.MediaInformation();
     mediaInfo.contentId = url;
     mediaInfo.streamType = cast.framework.messages.StreamType.BUFFERED;
-    mediaInfo.contentType = guessMime(url);
+    // Progressive types (video/mp4, video/x-matroska, video/webm) → plain media element, not Shaka.
+    mediaInfo.contentType = contentType || guessMime(url);
     if (customData) mediaInfo.customData = customData;
     const req = new cast.framework.messages.LoadRequestData();
     req.media = mediaInfo;
+    // Absolute file time via currentTime (no Shaka offset).
     req.currentTime = Math.max(0, (startMs || 0) / 1000);
     req.autoplay = autoplay !== false;
     if (customData) req.customData = customData;
     return req;
   }
 
-  function loadStream(url, positionMs, playing, reason) {
-    if (!isHttpUrl(url)) {
-      console.log('[cue-receiver] no stream URL yet (' + reason + ') — UI only');
-      renderUi();
+  function armStallWatch() {
+    if (!ladder || !ladder.steps.length) return;
+    clearLadderTimer();
+    const stallMs = (ladder.meta && ladder.meta.stallMs) || DEFAULT_STALL_MS;
+    const gen = ladder.loadGen;
+    const stepInfo = ladder.steps[ladder.idx];
+    ladder.stallTimer = setTimeout(function () {
+      if (!ladder || ladder.loadGen !== gen || ladder.reported) return;
+      console.warn('[cue-receiver] stall >' + stallMs + 'ms on step', stepInfo && stepInfo.step);
+      tryNextStep('stall');
+    }, stallMs);
+  }
+
+  function tryNextStep(why) {
+    if (!ladder || ladder.reported) return;
+    const failed = ladder.steps[ladder.idx];
+    if (!failed) return;
+    // Intermediate failure: report only if no more steps; otherwise advance quietly.
+    if (ladder.idx + 1 >= ladder.steps.length) {
+      emitCafPlay(failed.step, why === 'stall' ? 'stall' : ('error:' + why), -1, failed.contentType);
       return;
     }
-    if (url === currentStreamUrl && loadingUrl !== url) {
-      // Same file: seek/play through CAF — do not re-LOAD.
-      seekToMs(positionMs || 0);
-      if (playing) playMedia(); else pauseMedia();
-      return;
-    }
+    console.log('[cue-receiver] step', failed.step, why, '→ trying next');
+    ladder.idx += 1;
+    ladder.startedAt = nowElapsed();
+    ladder.reported = false;
+    loadLadderStep('fallback-' + why);
+  }
+
+  function loadLadderStep(reason) {
+    if (!ladder || !ladder.steps.length) return;
+    const stepInfo = ladder.steps[ladder.idx];
+    if (!stepInfo) return;
+    const url = stepInfo.url;
+    const positionMs = ladder.positionMs || 0;
+    const playing = ladder.playing !== false;
     loadingUrl = url;
     currentStreamUrl = url;
+    ladder.loadGen = (ladder.loadGen || 0) + 1;
     const st = rx.status;
     if (st) {
       const t = rx.playlist[st.titleIndex];
       if (t && t.ratingKey) urlByRatingKey[t.ratingKey] = url;
     }
-    const req = buildLoadRequest(url, positionMs || 0, playing !== false, statusCustomData());
-    console.log('[cue-receiver] loadStream', reason, url.slice(0, 64), 'pos=' + positionMs);
+    const req = buildLoadRequest(url, positionMs, playing, statusCustomData(), stepInfo.contentType);
+    console.log('[cue-receiver] loadStep', reason, 'step=' + stepInfo.step, stepInfo.contentType,
+      url.slice(0, 72), 'pos=' + positionMs);
+    armStallWatch();
     playerManager.load(req).then(function () {
       loadingUrl = '';
-      console.log('[cue-receiver] loadStream ok', reason);
+      console.log('[cue-receiver] loadStep accepted', reason, 'step=' + stepInfo.step);
+      // Seek again after load — progressive media has no Shaka offset param.
+      if (positionMs > 0) {
+        try { el.media.currentTime = positionMs / 1000; } catch (e) {}
+        seekToMs(positionMs);
+      }
     }).catch(function (err) {
       loadingUrl = '';
-      console.warn('[cue-receiver] loadStream failed', err);
+      console.warn('[cue-receiver] loadStep failed', reason, err);
+      tryNextStep('load');
     });
+  }
+
+  function beginLadder(custom, fallbackUrl, positionMs, playing, reason) {
+    const built = buildStepsFromCustom(custom || {}, fallbackUrl);
+    if (!built.steps.length) {
+      console.log('[cue-receiver] no stream URL yet (' + reason + ') — UI only');
+      renderUi();
+      return;
+    }
+    clearLadderTimer();
+    ladder = {
+      clipId: (rx.status && rx.status.clipId) || (custom && custom.clipId) || '',
+      steps: built.steps,
+      idx: 0,
+      startedAt: nowElapsed(),
+      reported: false,
+      meta: built.meta,
+      stallTimer: null,
+      loadGen: 0,
+      positionMs: positionMs || 0,
+      playing: playing !== false,
+    };
+    loadLadderStep(reason || 'begin');
+  }
+
+  function loadStream(url, positionMs, playing, reason, custom) {
+    if (custom || (ladder && ladder.meta)) {
+      beginLadder(custom || {}, url, positionMs, playing, reason);
+      return;
+    }
+    if (!isHttpUrl(url)) {
+      console.log('[cue-receiver] no stream URL yet (' + reason + ') — UI only');
+      renderUi();
+      return;
+    }
+    beginLadder({ directUrl: url, preferredStep: 1 }, url, positionMs, playing, reason);
   }
 
   function preloadNext() {
@@ -990,65 +1147,37 @@
         null;
       const contentId = loadRequestData && loadRequestData.media && loadRequestData.media.contentId;
       const msg = parseMessage(custom);
+      const hasLadder = !!(custom && (custom.directUrl || custom.remuxUrl || custom.preferredStep));
 
       if (msg && msg.type === TYPE.PLAYLIST) {
         const applied = applyMessage(msg, 'LOAD');
-        if (isHttpUrl(contentId)) {
-          const st = rx.status;
-          if (st) {
-            const t = rx.playlist[st.titleIndex];
-            if (t && t.ratingKey) urlByRatingKey[t.ratingKey] = contentId;
-          }
-          // Same stream already playing → seek/play via CAF, reject duplicate LOAD.
-          if (currentStreamUrl && contentId === currentStreamUrl && rx.playlistAdopted) {
-            const pos = applied ? applied.positionMs : (loadRequestData.currentTime || 0) * 1000;
-            const playing = applied ? applied.playing : loadRequestData.autoplay !== false;
-            seekToMs(pos);
-            if (playing) playMedia(); else pauseMedia();
-            if (loadRequestData.media) loadRequestData.media.customData = statusCustomData();
-            loadRequestData.customData = statusCustomData();
-            console.log('[cue-receiver] LOAD same URL → seek/play, no reload');
-            return null;
-          }
-          currentStreamUrl = contentId;
-          loadingUrl = contentId;
-          if (applied) {
-            loadRequestData.currentTime = (applied.positionMs || 0) / 1000;
-            loadRequestData.autoplay = applied.playing !== false;
-          }
-          if (loadRequestData.media) loadRequestData.media.customData = statusCustomData();
-          loadRequestData.customData = statusCustomData();
-          return loadRequestData;
-        }
-        // contentId is clipId / non-URL: rewrite to known stream or wait.
-        const st = rx.status;
-        const url = (st && urlForTitleIndex(st.titleIndex)) || currentStreamUrl;
-        if (isHttpUrl(url)) {
-          if (url === currentStreamUrl) {
-            const pos = applied ? applied.positionMs : playerPosMs();
-            seekToMs(pos);
-            if (!applied || applied.playing) playMedia(); else pauseMedia();
-            return null;
-          }
-          loadRequestData.media.contentId = url;
-          loadRequestData.media.contentType = guessMime(url);
-          if (applied) {
-            loadRequestData.currentTime = (applied.positionMs || 0) / 1000;
-            loadRequestData.autoplay = applied.playing !== false;
-          }
-          loadRequestData.media.customData = statusCustomData();
-          loadRequestData.customData = statusCustomData();
-          currentStreamUrl = url;
-          return loadRequestData;
+        const pos = applied ? applied.positionMs : ((loadRequestData.currentTime || 0) * 1000);
+        const playing = applied ? applied.playing : loadRequestData.autoplay !== false;
+        if (hasLadder || isHttpUrl(contentId)) {
+          // Hand off to progressive ladder (reject CAF default LOAD so we control contentType).
+          beginLadder(custom || { directUrl: contentId }, contentId, pos, playing, 'LOAD-playlist');
+          return null;
         }
         console.log('[cue-receiver] LOAD playlist without stream URL — UI wait');
         renderUi();
         return null;
       }
 
-      if (isHttpUrl(contentId)) {
-        currentStreamUrl = contentId;
-        return loadRequestData;
+      // Goto / thin clip LOAD with ladder fields (v3.5.60 progressive).
+      if (hasLadder || isHttpUrl(contentId)) {
+        if (msg && msg.type === TYPE.GOTO) applyMessage(msg, 'LOAD-goto');
+        const pos = (msg && msg.positionMs != null) ? msg.positionMs
+          : Math.round((loadRequestData.currentTime || 0) * 1000);
+        const playing = loadRequestData.autoplay !== false;
+        // Same URL already playing → seek only.
+        if (isHttpUrl(contentId) && contentId === currentStreamUrl && ladder && ladder.reported) {
+          seekToMs(pos);
+          if (playing) playMedia(); else pauseMedia();
+          console.log('[cue-receiver] LOAD same URL → seek/play, no reload');
+          return null;
+        }
+        beginLadder(custom || { directUrl: contentId }, contentId, pos, playing, 'LOAD');
+        return null;
       }
       console.log('[cue-receiver] reject LOAD without URL/playlist', contentId);
       return null;
@@ -1152,6 +1281,11 @@
     startClipWatch();
     preloadNext();
     emitPlaybackStatus('load-complete');
+    if (ladder && !ladder.reported && ladder.steps[ladder.idx]) {
+      const stepInfo = ladder.steps[ladder.idx];
+      const ttff = Math.max(0, nowElapsed() - (ladder.startedAt || nowElapsed()));
+      emitCafPlay(stepInfo.step, 'ok', ttff, stepInfo.contentType);
+    }
   });
 
   playerManager.addEventListener(cast.framework.events.EventType.MEDIA_FINISHED, function () {
@@ -1162,8 +1296,18 @@
     emitPlaybackStatus('media-status');
   });
 
-  /** Forward CAF/Shaka media failures to the phone (CastSync mediaError + status.error*). */
+  /** Forward CAF media failures to the phone; try next progressive ladder step first. */
   function emitMediaError(err, reason) {
+    if (ladder && !ladder.reported && ladder.idx + 1 < ladder.steps.length) {
+      const code = (err && (err.detailedErrorCode != null ? String(err.detailedErrorCode) : '')) || reason || 'err';
+      tryNextStep(code);
+      return;
+    }
+    if (ladder && !ladder.reported && ladder.steps[ladder.idx]) {
+      const stepInfo = ladder.steps[ladder.idx];
+      const code = (err && (err.detailedErrorCode != null ? String(err.detailedErrorCode) : '')) || reason || 'MEDIA_ERROR';
+      emitCafPlay(stepInfo.step, 'error:' + code, -1, stepInfo.contentType);
+    }
     const clip = rx.status ? rx.status.clipId : '';
     const detailed = (err && (err.detailedErrorCode != null ? String(err.detailedErrorCode) : '')) || '';
     const shaka = (err && err.shakaErrorCode != null) ? String(err.shakaErrorCode)
@@ -1175,7 +1319,7 @@
       shaka ? ('shaka=' + shaka) : '',
       (err && err.message) ? String(err.message) : '',
       currentStreamUrl ? ('url=' + String(currentStreamUrl).slice(0, 120)) : '',
-      'hint=Plex_GET_ACAO_is_app.plex.tv_not_receiver_origin_CORS',
+      ladder ? ('ladderStep=' + (ladder.steps[ladder.idx] && ladder.steps[ladder.idx].step)) : '',
     ].filter(Boolean).join(' ');
     console.warn('[cue-receiver] MEDIA_ERROR', code, detail, err);
     const at = nowElapsed();
@@ -1214,8 +1358,15 @@
       emitMediaError(event, 'MEDIA_ERROR');
     });
   } catch (e) {}
-  // HTMLMediaElement error (idleReason=4 path).
+  // HTMLMediaElement: first frame + error (progressive path).
   if (el.media) {
+    el.media.addEventListener('loadeddata', function () {
+      if (ladder && !ladder.reported && ladder.steps[ladder.idx]) {
+        const stepInfo = ladder.steps[ladder.idx];
+        const ttff = Math.max(0, nowElapsed() - (ladder.startedAt || nowElapsed()));
+        emitCafPlay(stepInfo.step, 'ok', ttff, stepInfo.contentType);
+      }
+    });
     el.media.addEventListener('error', function () {
       const me = el.media.error;
       emitMediaError({
@@ -1313,7 +1464,7 @@
   beginSession();
   context.start(options);
   startClipWatch();
-  console.log('[cue-receiver] started App ID 30917C87 — CAF-bound #media via setMediaElement, CastSync v2, origin=' + SELF);
+  console.log('[cue-receiver] started App ID 30917C87 — progressive ladder (direct→http-mp4, HLS off), CastSync v2, origin=' + SELF);
 })();
   </script>
 </body>
