@@ -835,10 +835,8 @@
     switch (msg.type) {
       case TYPE.PLAYLIST: {
         rememberUrlsFromTitles(msg.titles);
-        // First playlist → REPLACE; later windows merge by ratingKey.
-        rx.playlist = (!rx.playlist || !rx.playlist.length)
-          ? (msg.titles || []).slice()
-          : mergePlaylistByRatingKey(rx.playlist, msg.titles);
+        // Phone window is authority — always REPLACE (never keep Chromecast-local leftovers).
+        rx.playlist = (msg.titles || []).slice();
         rx.kind = msg.kind || rx.kind;
         rx.prompt = msg.prompt || rx.prompt;
         rx.playlistAdopted = true;
@@ -1163,6 +1161,69 @@
   playerManager.addEventListener(cast.framework.events.EventType.MEDIA_STATUS, function () {
     emitPlaybackStatus('media-status');
   });
+
+  /** Forward CAF/Shaka media failures to the phone (CastSync mediaError + status.error*). */
+  function emitMediaError(err, reason) {
+    const clip = rx.status ? rx.status.clipId : '';
+    const detailed = (err && (err.detailedErrorCode != null ? String(err.detailedErrorCode) : '')) || '';
+    const shaka = (err && err.shakaErrorCode != null) ? String(err.shakaErrorCode)
+      : (err && err.error && err.error.code != null) ? String(err.error.code) : '';
+    const code = detailed || shaka || (err && err.type) || reason || 'MEDIA_ERROR';
+    const detail = [
+      reason || '',
+      detailed ? ('detailedErrorCode=' + detailed) : '',
+      shaka ? ('shaka=' + shaka) : '',
+      (err && err.message) ? String(err.message) : '',
+      currentStreamUrl ? ('url=' + String(currentStreamUrl).slice(0, 120)) : '',
+      'hint=Plex_GET_ACAO_is_app.plex.tv_not_receiver_origin_CORS',
+    ].filter(Boolean).join(' ');
+    console.warn('[cue-receiver] MEDIA_ERROR', code, detail, err);
+    const at = nowElapsed();
+    const me = {
+      v: 2,
+      type: TYPE.MEDIA_ERROR,
+      epoch: rx.epoch,
+      seq: nextOutSeq(),
+      origin: SELF,
+      clipId: clip,
+      errorCode: String(code),
+      errorDetail: detail.slice(0, 500),
+      contentId: currentStreamUrl || '',
+    };
+    try { context.sendCustomMessage(NAMESPACE, undefined, me); } catch (e) {}
+    if (rx.status) {
+      rx.status = makeStatus({
+        clipId: clip,
+        titleIndex: rx.status.titleIndex,
+        sceneIndex: rx.status.sceneIndex,
+        positionMs: rx.status.positionMs,
+        playing: false,
+        atElapsedMs: at,
+      });
+      rx.status.errorCode = String(code);
+      rx.status.errorDetail = detail.slice(0, 500);
+      broadcastStatus(rx.status, 'media-error');
+    }
+  }
+
+  playerManager.addEventListener(cast.framework.events.EventType.ERROR, function (event) {
+    emitMediaError(event && (event.error || event), 'PLAYER_ERROR');
+  });
+  try {
+    playerManager.addEventListener(cast.framework.events.EventType.MEDIA_ERROR || 'MEDIA_ERROR', function (event) {
+      emitMediaError(event, 'MEDIA_ERROR');
+    });
+  } catch (e) {}
+  // HTMLMediaElement error (idleReason=4 path).
+  if (el.media) {
+    el.media.addEventListener('error', function () {
+      const me = el.media.error;
+      emitMediaError({
+        detailedErrorCode: me ? me.code : '',
+        message: me ? ('MediaError.code=' + me.code + ' ' + (me.message || '')) : 'media element error',
+      }, 'HTML_MEDIA_ERROR');
+    });
+  }
 
   context.addCustomMessageListener(NAMESPACE, function (event) {
     const msg = parseMessage(event.data);
