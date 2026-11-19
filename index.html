@@ -6,166 +6,1193 @@
   <title>Cue Shorts Receiver</title>
   <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <style>
-    :root { color-scheme: dark; }
-    html, body { margin: 0; height: 100%; background: #0b0b0d; overflow: hidden; font-family: "Google Sans", system-ui, sans-serif; }
-    #stage { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #0b0b0d; }
-    video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+    :root {
+      color-scheme: dark;
+      --ink: #f4f4f5;
+      --muted: rgba(244, 244, 245, 0.72);
+      --chip: rgba(255, 255, 255, 0.14);
+      --chip-on: rgba(255, 255, 255, 0.92);
+      --chip-on-ink: #111;
+      --bar: rgba(255, 255, 255, 0.22);
+      --bar-fill: #fff;
+    }
+    html, body {
+      margin: 0; height: 100%; overflow: hidden;
+      background: #050506;
+      font-family: "Google Sans", "Segoe UI", system-ui, sans-serif;
+      color: var(--ink);
+    }
+    #root { position: absolute; inset: 0; }
+    #art {
+      position: absolute; inset: -24px;
+      background: #111 center / cover no-repeat;
+      filter: blur(36px) saturate(1.15);
+      transform: scale(1.08);
+      opacity: 0.55;
+      transition: opacity 400ms ease, background-image 400ms ease;
+    }
+    #art::after {
+      content: "";
+      position: absolute; inset: 0;
+      background: linear-gradient(180deg, rgba(0,0,0,.35) 0%, rgba(0,0,0,.2) 40%, rgba(0,0,0,.78) 100%);
+    }
+    /* CAF-bound media element (playerManager.setMediaElement) — not orphaned */
+    #media {
+      position: absolute; inset: 0;
+      width: 100%; height: 100%;
+      object-fit: contain;
+      background: transparent;
+      z-index: 1;
+    }
+    #idle, #waiting {
+      position: absolute; inset: 0; z-index: 3;
+      display: grid; place-items: center;
+      text-align: center;
+      background: radial-gradient(ellipse at center, #1a1a1f 0%, #050506 70%);
+    }
+    #idle h1, #waiting h1 {
+      font-size: clamp(48px, 8vw, 72px);
+      font-weight: 650;
+      letter-spacing: -0.04em;
+      margin: 0 0 10px;
+    }
+    #idle p, #waiting p {
+      margin: 0;
+      font-size: clamp(18px, 2.4vw, 26px);
+      color: var(--muted);
+    }
     #overlay {
-      position: absolute; left: 0; right: 0; bottom: 0;
-      padding: 48px 56px 64px;
-      background: linear-gradient(transparent, rgba(0,0,0,.85));
+      position: absolute; left: 0; right: 0; bottom: 0; z-index: 4;
+      padding: 56px 56px 48px;
+      background: linear-gradient(transparent, rgba(0,0,0,.88) 55%);
+      opacity: 0;
+      transform: translateY(12px);
+      transition: opacity 280ms ease, transform 280ms ease;
       pointer-events: none;
     }
-    #title { font-size: 42px; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 8px; color: #fff; }
-    #meta { font-size: 22px; opacity: .75; margin: 0; color: #fff; }
-    #idle {
-      position: absolute; inset: 0; display: grid; place-items: center;
-      color: #f2f2f2; text-align: center;
+    #overlay.show { opacity: 1; transform: translateY(0); }
+    #title {
+      font-size: clamp(28px, 4.2vw, 44px);
+      font-weight: 650;
+      letter-spacing: -0.03em;
+      margin: 0 0 10px;
+      text-shadow: 0 2px 18px rgba(0,0,0,.45);
     }
-    #idle h1 { font-size: 64px; margin: 0 0 12px; letter-spacing: -0.03em; }
-    #idle p { font-size: 24px; opacity: .65; margin: 0; }
+    #scene-label {
+      font-size: clamp(16px, 2vw, 22px);
+      color: var(--muted);
+      margin: 0 0 18px;
+      max-width: 90%;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #chips {
+      display: flex; flex-wrap: wrap; gap: 10px;
+      margin: 0 0 22px;
+      max-width: 92%;
+    }
+    .chip {
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: var(--chip);
+      color: var(--ink);
+      font-size: 15px;
+      font-weight: 500;
+      max-width: 280px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .chip.on { background: var(--chip-on); color: var(--chip-on-ink); }
+    #progress {
+      height: 4px;
+      width: min(720px, 70vw);
+      background: var(--bar);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    #progress > i {
+      display: block; height: 100%; width: 0%;
+      background: var(--bar-fill);
+      border-radius: 4px;
+      transition: width 160ms linear;
+    }
+    #badge {
+      position: absolute; top: 36px; left: 48px; z-index: 4;
+      font-size: 15px; font-weight: 600; letter-spacing: 0.08em;
+      text-transform: uppercase; color: var(--muted);
+      opacity: 0; transition: opacity 280ms ease;
+    }
+    #badge.show { opacity: 1; }
     .hidden { display: none !important; }
   </style>
 </head>
 <body>
-  <div id="idle">
-    <div>
-      <h1>Cue</h1>
-      <p>Waiting for Shorts from your phone…</p>
+  <div id="root">
+    <div id="art" aria-hidden="true"></div>
+    <!-- Bound to CAF via playerManager.setMediaElement — not an orphaned video. -->
+    <video id="media" playsinline crossorigin="anonymous"></video>
+
+    <div id="idle">
+      <div>
+        <h1>Cue</h1>
+        <p>Waiting for Shorts from your phone…</p>
+      </div>
     </div>
-  </div>
-  <div id="stage" class="hidden">
-    <video id="player" playsinline></video>
+
+    <div id="waiting" class="hidden">
+      <div>
+        <h1 id="wait-title">Cue</h1>
+        <p id="wait-meta">Waiting for stream…</p>
+      </div>
+    </div>
+
+    <div id="badge">Cue Shorts</div>
     <div id="overlay">
       <p id="title"></p>
-      <p id="meta"></p>
+      <p id="scene-label"></p>
+      <div id="chips"></div>
+      <div id="progress"><i id="progress-fill"></i></div>
     </div>
   </div>
+
   <script>
-    const NAMESPACE = 'urn:x-cast:com.efraimbart.cue.shorts';
-    const context = cast.framework.CastReceiverContext.getInstance();
-    const playerManager = context.getPlayerManager();
-    const video = document.getElementById('player');
-    const idle = document.getElementById('idle');
-    const stage = document.getElementById('stage');
-    const titleEl = document.getElementById('title');
-    const metaEl = document.getElementById('meta');
+(function () {
+  'use strict';
 
-    let state = null;
-    let seq = 0;
+  // CastSync v2 protocol — mirror of CastSync.kt (receiver is authority).
+  const NAMESPACE = 'urn:x-cast:com.efraimbart.cue.shorts';
+  const SELF = 'web';
+  const TYPE = {
+    PLAYLIST: 'playlist',
+    GOTO: 'goto',
+    PLAY: 'play',
+    PAUSE: 'pause',
+    SEEK: 'seek',
+    STATUS: 'status',
+  };
 
-    function showPlaying() {
-      idle.classList.add('hidden');
-      stage.classList.remove('hidden');
-    }
+  const el = {
+    media: document.getElementById('media'),
+    art: document.getElementById('art'),
+    idle: document.getElementById('idle'),
+    waiting: document.getElementById('waiting'),
+    waitTitle: document.getElementById('wait-title'),
+    waitMeta: document.getElementById('wait-meta'),
+    overlay: document.getElementById('overlay'),
+    badge: document.getElementById('badge'),
+    title: document.getElementById('title'),
+    sceneLabel: document.getElementById('scene-label'),
+    chips: document.getElementById('chips'),
+    progressFill: document.getElementById('progress-fill'),
+  };
 
-    function currentScene(st) {
-      const titles = st.titles || [];
-      const ti = Math.max(0, Math.min(st.titleIndex || 0, Math.max(0, titles.length - 1)));
-      const title = titles[ti] || {};
-      const scenes = title.scenes || [];
-      const si = Math.max(0, Math.min(st.sceneIndex || 0, Math.max(0, scenes.length - 1)));
-      return { titles, ti, title, scenes, si, scene: scenes[si] || {} };
-    }
+  const rx = {
+    epoch: 0,
+    outSeq: 0,
+    lastSeqByOrigin: Object.create(null),
+    playlist: [],
+    kind: 'BOTH',
+    prompt: '',
+    status: null,
+    playlistAdopted: false,
+  };
 
-    function sendState(st, reason) {
-      if (!st) return;
-      try {
-        context.sendCustomMessage(NAMESPACE, undefined, st);
-        console.log('[cue-receiver] sent', reason, st.seq, st.origin, st.positionMs);
-      } catch (e) { console.warn('[cue-receiver] send failed', e); }
-    }
+  /** ratingKey → last known stream URL (from MediaInfo contentId). */
+  const urlByRatingKey = Object.create(null);
+  let currentStreamUrl = '';
+  let loadingUrl = '';
+  let overlayTimer = null;
+  let clipWatchTimer = null;
+  let advancing = false;
+  let lastUiSig = '';
 
-    function applyState(st, reason) {
-      if (!st || typeof st !== 'object') return;
-      if (st.seq != null && st.seq < seq && reason !== 'force') return;
-      seq = st.seq || seq;
-      state = st;
-      const cur = currentScene(st);
-      titleEl.textContent = cur.title.title || 'Cue Shorts';
-      metaEl.textContent = (cur.scene.description || cur.scene.title || '') +
-        (cur.titles.length ? `  ·  ${cur.ti + 1}/${cur.titles.length}` : '');
-      showPlaying();
-      console.log('[cue-receiver] apply', reason, st.seq, cur.title.ratingKey, cur.scene.startMs, st.positionMs);
-    }
+  function nowElapsed() { return Math.round(performance.now()); }
 
-    function bump(deltaTitle, deltaScene) {
-      if (!state || !state.titles || !state.titles.length) return;
-      let ti = state.titleIndex || 0;
-      let si = state.sceneIndex || 0;
-      const scenes = (state.titles[ti] && state.titles[ti].scenes) || [];
-      if (deltaScene) {
-        si += deltaScene;
-        if (si >= scenes.length) { ti = Math.min(ti + 1, state.titles.length - 1); si = 0; }
-        if (si < 0) { ti = Math.max(ti - 1, 0); si = Math.max(0, ((state.titles[ti].scenes || []).length - 1)); }
+  function isHttpUrl(s) {
+    return typeof s === 'string' && /^https?:\/\//i.test(s.trim());
+  }
+
+  function clipIdOf(scene) {
+    if (!scene) return '';
+    if (scene.clipId) return String(scene.clipId);
+    return (scene.ratingKey || 'x') + '@' + (scene.startMs || 0);
+  }
+
+  function sceneAt(ti, si) {
+    const t = rx.playlist[ti];
+    if (!t) return null;
+    return (t.scenes || [])[si] || null;
+  }
+
+  function findByClipId(clipId) {
+    if (!clipId) return null;
+    for (let ti = 0; ti < rx.playlist.length; ti++) {
+      const scenes = rx.playlist[ti].scenes || [];
+      for (let si = 0; si < scenes.length; si++) {
+        if (clipIdOf(scenes[si]) === clipId) return { ti: ti, si: si };
       }
-      if (deltaTitle) {
-        ti = Math.max(0, Math.min(ti + deltaTitle, state.titles.length - 1));
-        si = 0;
-      }
-      const next = Object.assign({}, state, {
-        seq: (state.seq || 0) + 1,
-        origin: 'web',
-        titleIndex: ti,
-        sceneIndex: si,
-        positionMs: (((state.titles[ti] || {}).scenes || [])[si] || {}).startMs || 0,
-        playing: true,
-      });
-      applyState(next, 'nav');
-      sendState(next, 'nav');
     }
+    return null;
+  }
 
-    playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, loadRequestData => {
-      const custom = loadRequestData.customData ||
-        (loadRequestData.media && loadRequestData.media.customData) || null;
-      if (custom) {
-        applyState(custom, 'LOAD');
-        // Keep ShortsCastState on media so MediaStatus.customData reaches the phone.
-        loadRequestData.customData = custom;
-        if (loadRequestData.media) loadRequestData.media.customData = custom;
-      }
-      return loadRequestData;
-    });
-
-    context.addCustomMessageListener(NAMESPACE, event => {
-      applyState(event.data, 'custom');
-    });
-
-    playerManager.addEventListener(cast.framework.events.EventType.MEDIA_FINISHED, () => bump(0, 1));
-    // Play/pause changes → phone (seq bump). Position streams via MediaStatus / RemoteMediaClient.
-    playerManager.addEventListener(cast.framework.events.EventType.MEDIA_STATUS, () => {
-      if (!state) return;
-      try {
-        const pos = playerManager.getCurrentTimeSec();
-        const playing = playerManager.getPlayerState() === cast.framework.messages.PlayerState.PLAYING;
-        const posMs = (typeof pos === 'number' && !isNaN(pos)) ? Math.round(pos * 1000) : (state.positionMs || 0);
-        if (!!playing === !!state.playing && Math.abs(posMs - (state.positionMs || 0)) < 800) return;
-        const playChanged = !!playing !== !!state.playing;
-        const next = Object.assign({}, state, {
-          seq: playChanged ? (state.seq || 0) + 1 : (state.seq || 0),
-          origin: 'web',
-          positionMs: posMs,
-          playing: !!playing,
+  function parseTitle(o) {
+    const scenes = [];
+    const arr = o && o.scenes;
+    if (Array.isArray(arr)) {
+      for (let i = 0; i < arr.length; i++) {
+        const s = arr[i] || {};
+        scenes.push({
+          startMs: Number(s.startMs) || 0,
+          endMs: Number(s.endMs) || 0,
+          partKey: String(s.partKey || ''),
+          title: String(s.title || ''),
+          description: String(s.description || ''),
+          ratingKey: String(s.ratingKey || ''),
+          itemType: String(s.itemType || ''),
+          clipId: String(s.clipId || ''),
+          streamUrl: isHttpUrl(s.streamUrl) ? s.streamUrl : (isHttpUrl(s.url) ? s.url : ''),
         });
-        state = next;
-        if (playChanged) { seq = next.seq; sendState(next, 'play-state'); }
-      } catch (e) {}
-    });
+      }
+    }
+    return {
+      ratingKey: String((o && o.ratingKey) || ''),
+      title: String((o && o.title) || ''),
+      type: String((o && o.type) || 'movie'),
+      year: o && o.year != null ? Number(o.year) : null,
+      artUrl: String((o && o.artUrl) || ''),
+      streamUrl: isHttpUrl(o && o.streamUrl) ? o.streamUrl : (isHttpUrl(o && o.url) ? o.url : ''),
+      scenes: scenes,
+    };
+  }
 
-    document.addEventListener('keydown', e => {
-      if (e.key === 'ArrowDown' || e.key === 'MediaTrackNext') bump(1, 0);
-      if (e.key === 'ArrowUp' || e.key === 'MediaTrackPrevious') bump(-1, 0);
-      if (e.key === 'ArrowRight') bump(0, 1);
-      if (e.key === 'ArrowLeft') bump(0, -1);
+  function mergePlaylistByRatingKey(existing, incoming) {
+    if (!incoming || !incoming.length) return existing || [];
+    if (!existing || !existing.length) return incoming.slice();
+    const byKey = Object.create(null);
+    for (let i = 0; i < incoming.length; i++) byKey[incoming[i].ratingKey] = incoming[i];
+    const merged = existing.map(function (t) {
+      const neu = byKey[t.ratingKey];
+      if (!neu) return t;
+      return {
+        ratingKey: t.ratingKey,
+        title: neu.title || t.title,
+        type: neu.type || t.type,
+        year: neu.year != null ? neu.year : t.year,
+        artUrl: neu.artUrl || t.artUrl,
+        streamUrl: neu.streamUrl || t.streamUrl,
+        scenes: (neu.scenes && neu.scenes.length) ? neu.scenes : t.scenes,
+      };
     });
+    const have = Object.create(null);
+    for (let i = 0; i < merged.length; i++) have[merged[i].ratingKey] = true;
+    for (let i = 0; i < incoming.length; i++) {
+      if (!have[incoming[i].ratingKey]) merged.push(incoming[i]);
+    }
+    return merged;
+  }
 
-    const options = new cast.framework.CastReceiverOptions();
-    options.customNamespaces = Object.assign({}, options.customNamespaces || {}, {
-      [NAMESPACE]: cast.framework.system.MessageType.JSON
+  /** Parse v1 ShortsCastState (no type) or v2 CastSync message. */
+  function parseMessage(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    if (!raw.type && Array.isArray(raw.titles)) {
+      const titles = raw.titles.map(parseTitle);
+      const titleIndex = Math.max(0, Number(raw.titleIndex) || 0);
+      const sceneIndex = Math.max(0, Number(raw.sceneIndex) || 0);
+      return {
+        type: TYPE.PLAYLIST,
+        epoch: Number(raw.epoch) || 1,
+        seq: Number(raw.seq) || 0,
+        origin: String(raw.origin || 'phone'),
+        kind: String(raw.kind || 'BOTH'),
+        prompt: String(raw.prompt || ''),
+        titleIndex: titleIndex,
+        sceneIndex: sceneIndex,
+        positionMs: Number(raw.positionMs != null ? raw.positionMs : raw.castStartMs) || 0,
+        playing: raw.playing !== false,
+        titles: titles,
+        windowStart: Number(raw.windowStart) || 0,
+        clipId: String(raw.clipId || clipIdOf(
+          titles[titleIndex] && titles[titleIndex].scenes && titles[titleIndex].scenes[sceneIndex]
+        )),
+      };
+    }
+    const type = String(raw.type || '');
+    const base = {
+      type: type,
+      epoch: Number(raw.epoch) || 0,
+      seq: Number(raw.seq) || 0,
+      origin: String(raw.origin || 'phone'),
+    };
+    switch (type) {
+      case TYPE.PLAYLIST: {
+        const titles = Array.isArray(raw.titles) ? raw.titles.map(parseTitle) : [];
+        const titleIndex = Math.max(0, Number(raw.titleIndex) || 0);
+        const sceneIndex = Math.max(0, Number(raw.sceneIndex) || 0);
+        const localTi = Math.max(0, titleIndex - (Number(raw.windowStart) || 0));
+        return Object.assign(base, {
+          kind: String(raw.kind || 'BOTH'),
+          prompt: String(raw.prompt || ''),
+          titleIndex: titleIndex,
+          sceneIndex: sceneIndex,
+          positionMs: Number(raw.positionMs) || 0,
+          playing: raw.playing !== false,
+          titles: titles,
+          windowStart: Number(raw.windowStart) || 0,
+          clipId: String(raw.clipId || clipIdOf(
+            titles[localTi] && titles[localTi].scenes && titles[localTi].scenes[sceneIndex]
+          )),
+        });
+      }
+      case TYPE.GOTO:
+        return Object.assign(base, {
+          clipId: String(raw.clipId || ''),
+          titleIndex: Number(raw.titleIndex) || 0,
+          sceneIndex: Number(raw.sceneIndex) || 0,
+          positionMs: Number(raw.positionMs) || 0,
+        });
+      case TYPE.PLAY:
+      case TYPE.PAUSE:
+        return base;
+      case TYPE.SEEK:
+        return Object.assign(base, { positionMs: Number(raw.positionMs) || 0 });
+      case TYPE.STATUS:
+        return Object.assign(base, {
+          clipId: String(raw.clipId || ''),
+          titleIndex: Number(raw.titleIndex) || 0,
+          sceneIndex: Number(raw.sceneIndex) || 0,
+          positionMs: Number(raw.positionMs) || 0,
+          playing: raw.playing !== false,
+          rate: Number(raw.rate) || 1,
+          atElapsedMs: Number(raw.atElapsedMs) || 0,
+        });
+      default:
+        return null;
+    }
+  }
+
+  function beginSession() {
+    rx.epoch += 1;
+    rx.outSeq = 0;
+    rx.lastSeqByOrigin = Object.create(null);
+    rx.status = null;
+    console.log('[cue-receiver] beginSession epoch=' + rx.epoch);
+    return rx.epoch;
+  }
+
+  function shouldApply(msg) {
+    if (!msg) return false;
+    if (msg.origin === SELF) return false;
+    if (!rx.playlistAdopted && msg.type === TYPE.PLAYLIST) {
+      if (msg.epoch > 0) rx.epoch = msg.epoch;
+      else if (rx.epoch === 0) rx.epoch = 1;
+      return true;
+    }
+    if (msg.epoch !== rx.epoch) return false;
+    const last = rx.lastSeqByOrigin[msg.origin] || 0;
+    return msg.seq > last;
+  }
+
+  function markApplied(msg) {
+    const last = rx.lastSeqByOrigin[msg.origin] || 0;
+    rx.lastSeqByOrigin[msg.origin] = Math.max(last, msg.seq);
+  }
+
+  function nextOutSeq() {
+    rx.outSeq += 1;
+    return rx.outSeq;
+  }
+
+  function makeStatus(partial) {
+    const cur = rx.status || {};
+    return {
+      v: 2,
+      type: TYPE.STATUS,
+      epoch: rx.epoch,
+      seq: nextOutSeq(),
+      origin: SELF,
+      clipId: partial.clipId != null ? partial.clipId : (cur.clipId || ''),
+      titleIndex: partial.titleIndex != null ? partial.titleIndex : (cur.titleIndex || 0),
+      sceneIndex: partial.sceneIndex != null ? partial.sceneIndex : (cur.sceneIndex || 0),
+      positionMs: partial.positionMs != null ? partial.positionMs : (cur.positionMs || 0),
+      playing: partial.playing != null ? partial.playing : !!cur.playing,
+      rate: partial.rate != null ? partial.rate : (cur.rate != null ? cur.rate : 1),
+      atElapsedMs: partial.atElapsedMs != null ? partial.atElapsedMs : nowElapsed(),
+    };
+  }
+
+  function extrapolate(status, at) {
+    if (!status || !status.playing || !status.rate || !status.atElapsedMs) {
+      return status ? status.positionMs : 0;
+    }
+    const dt = Math.max(0, at - status.atElapsedMs);
+    return status.positionMs + Math.round(dt * status.rate);
+  }
+
+  function statusIfChanged(partial, slackMs) {
+    slackMs = slackMs == null ? 400 : slackMs;
+    const cur = rx.status;
+    const next = {
+      clipId: partial.clipId,
+      titleIndex: partial.titleIndex,
+      sceneIndex: partial.sceneIndex,
+      positionMs: partial.positionMs,
+      playing: partial.playing,
+      rate: partial.rate != null ? partial.rate : 1,
+    };
+    if (cur &&
+        cur.clipId === next.clipId &&
+        cur.titleIndex === next.titleIndex &&
+        cur.sceneIndex === next.sceneIndex &&
+        cur.playing === next.playing &&
+        Math.abs((cur.rate || 1) - next.rate) < 0.01 &&
+        Math.abs(extrapolate(cur, nowElapsed()) - next.positionMs) <= slackMs) {
+      return null;
+    }
+    const s = makeStatus(Object.assign({}, next, { atElapsedMs: nowElapsed() }));
+    rx.status = s;
+    return s;
+  }
+
+  function broadcastStatus(status, reason) {
+    if (!status) return;
+    try {
+      context.sendCustomMessage(NAMESPACE, undefined, status);
+      console.log('[cue-receiver] status', reason, 'seq=' + status.seq, status.clipId, status.positionMs, status.playing);
+    } catch (e) {
+      console.warn('[cue-receiver] send failed', e);
+    }
+  }
+
+  function rememberUrlsFromTitles(titles) {
+    if (!titles) return;
+    for (let i = 0; i < titles.length; i++) {
+      const t = titles[i];
+      if (t.streamUrl) urlByRatingKey[t.ratingKey] = t.streamUrl;
+      const scenes = t.scenes || [];
+      for (let j = 0; j < scenes.length; j++) {
+        if (scenes[j].streamUrl) {
+          urlByRatingKey[t.ratingKey] = scenes[j].streamUrl;
+          if (scenes[j].ratingKey) urlByRatingKey[scenes[j].ratingKey] = scenes[j].streamUrl;
+        }
+      }
+    }
+  }
+
+  function urlForTitleIndex(ti) {
+    const t = rx.playlist[ti];
+    if (!t) return '';
+    if (t.streamUrl) return t.streamUrl;
+    if (urlByRatingKey[t.ratingKey]) return urlByRatingKey[t.ratingKey];
+    const curTi = rx.status ? rx.status.titleIndex : -1;
+    const curT = rx.playlist[curTi];
+    if (curT && curT.ratingKey === t.ratingKey && currentStreamUrl) return currentStreamUrl;
+    return '';
+  }
+
+  // ---- UI ----
+  function showOverlayTransient(ms) {
+    el.overlay.classList.add('show');
+    el.badge.classList.add('show');
+    clearTimeout(overlayTimer);
+    overlayTimer = setTimeout(function () {
+      el.overlay.classList.remove('show');
+      el.badge.classList.remove('show');
+    }, ms == null ? 3200 : ms);
+  }
+
+  function setArt(url) {
+    if (!url) {
+      el.art.style.backgroundImage = '';
+      return;
+    }
+    el.art.style.backgroundImage = 'url("' + String(url).replace(/"/g, '\\"') + '")';
+  }
+
+  function renderUi() {
+    const st = rx.status;
+    if (!st || !rx.playlist.length) {
+      el.idle.classList.remove('hidden');
+      el.waiting.classList.add('hidden');
+      return;
+    }
+    el.idle.classList.add('hidden');
+
+    const ti = st.titleIndex || 0;
+    const si = st.sceneIndex || 0;
+    const title = rx.playlist[ti] || {};
+    const scenes = title.scenes || [];
+    const scene = scenes[si] || {};
+    const hasUrl = !!(urlForTitleIndex(ti) || currentStreamUrl);
+
+    if (!hasUrl && !currentStreamUrl) {
+      el.waiting.classList.remove('hidden');
+      el.waitTitle.textContent = title.title || 'Cue';
+      el.waitMeta.textContent = 'Waiting for stream…';
+    } else {
+      el.waiting.classList.add('hidden');
+    }
+
+    setArt(title.artUrl || '');
+
+    const sig = [ti, si, title.title, scenes.length, st.clipId].join('|');
+    if (sig !== lastUiSig) {
+      lastUiSig = sig;
+      el.title.textContent = title.title || 'Cue Shorts';
+      el.sceneLabel.textContent = scene.description || scene.title ||
+        ((scenes.length ? (si + 1) + '/' + scenes.length : '') +
+          (rx.playlist.length ? '  ·  title ' + (ti + 1) + '/' + rx.playlist.length : ''));
+      el.chips.innerHTML = '';
+      const maxChips = 8;
+      const start = Math.max(0, Math.min(si - 2, Math.max(0, scenes.length - maxChips)));
+      const end = Math.min(scenes.length, start + maxChips);
+      for (let i = start; i < end; i++) {
+        const c = document.createElement('span');
+        c.className = 'chip' + (i === si ? ' on' : '');
+        c.textContent = scenes[i].title || scenes[i].description || ('Scene ' + (i + 1));
+        el.chips.appendChild(c);
+      }
+      showOverlayTransient();
+    }
+
+    const startMs = Number(scene.startMs) || 0;
+    const endMs = Number(scene.endMs) || (startMs + 30000);
+    const span = Math.max(1, endMs - startMs);
+    const pos = Math.max(startMs, Math.min(st.positionMs || startMs, endMs));
+    el.progressFill.style.width = (((pos - startMs) / span) * 100).toFixed(2) + '%';
+  }
+
+  // ---- CAF player (bound media element) ----
+  const context = cast.framework.CastReceiverContext.getInstance();
+  const playerManager = context.getPlayerManager();
+
+  // Bind the visible <video id="media"> to CAF so it is not orphaned.
+  playerManager.setMediaElement(el.media);
+
+  function playerPosMs() {
+    try {
+      const sec = playerManager.getCurrentTimeSec();
+      if (typeof sec === 'number' && !isNaN(sec)) return Math.round(sec * 1000);
+    } catch (e) {}
+    return rx.status ? rx.status.positionMs : 0;
+  }
+
+  function playerPlaying() {
+    try {
+      return playerManager.getPlayerState() === cast.framework.messages.PlayerState.PLAYING;
+    } catch (e) {
+      return !!(rx.status && rx.status.playing);
+    }
+  }
+
+  function emitPlaybackStatus(reason) {
+    if (!rx.status) return;
+    const scene = sceneAt(rx.status.titleIndex, rx.status.sceneIndex);
+    const s = statusIfChanged({
+      clipId: rx.status.clipId || clipIdOf(scene),
+      titleIndex: rx.status.titleIndex,
+      sceneIndex: rx.status.sceneIndex,
+      positionMs: playerPosMs(),
+      playing: playerPlaying(),
+      rate: 1,
     });
-    options.maxInactivity = 3600;
-    context.start(options);
-    console.log('[cue-receiver] started App ID 30917C87 Shorts CAF');
+    if (s) {
+      broadcastStatus(s, reason);
+      renderUi();
+    } else if (rx.status) {
+      rx.status.positionMs = playerPosMs();
+      renderUi();
+    }
+  }
+
+  function seekToMs(ms) {
+    try { playerManager.seek(ms / 1000); }
+    catch (e) { console.warn('[cue-receiver] seek failed', e); }
+  }
+
+  function playMedia() {
+    try { playerManager.play(); }
+    catch (e) { console.warn('[cue-receiver] play failed', e); }
+  }
+
+  function pauseMedia() {
+    try { playerManager.pause(); }
+    catch (e) { console.warn('[cue-receiver] pause failed', e); }
+  }
+
+  function guessMime(url) {
+    const u = String(url || '').toLowerCase();
+    if (u.indexOf('.m3u8') >= 0) return 'application/x-mpegurl';
+    if (u.indexOf('.mpd') >= 0) return 'application/dash+xml';
+    if (u.indexOf('.webm') >= 0) return 'video/webm';
+    return 'video/mp4';
+  }
+
+  function statusCustomData() {
+    return rx.status ? Object.assign({}, rx.status) : null;
+  }
+
+  function buildLoadRequest(url, startMs, autoplay, customData) {
+    const mediaInfo = new cast.framework.messages.MediaInformation();
+    mediaInfo.contentId = url;
+    mediaInfo.streamType = cast.framework.messages.StreamType.BUFFERED;
+    mediaInfo.contentType = guessMime(url);
+    if (customData) mediaInfo.customData = customData;
+    const req = new cast.framework.messages.LoadRequestData();
+    req.media = mediaInfo;
+    req.currentTime = Math.max(0, (startMs || 0) / 1000);
+    req.autoplay = autoplay !== false;
+    if (customData) req.customData = customData;
+    return req;
+  }
+
+  function loadStream(url, positionMs, playing, reason) {
+    if (!isHttpUrl(url)) {
+      console.log('[cue-receiver] no stream URL yet (' + reason + ') — UI only');
+      renderUi();
+      return;
+    }
+    if (url === currentStreamUrl && loadingUrl !== url) {
+      // Same file: seek/play through CAF — do not re-LOAD.
+      seekToMs(positionMs || 0);
+      if (playing) playMedia(); else pauseMedia();
+      return;
+    }
+    loadingUrl = url;
+    currentStreamUrl = url;
+    const st = rx.status;
+    if (st) {
+      const t = rx.playlist[st.titleIndex];
+      if (t && t.ratingKey) urlByRatingKey[t.ratingKey] = url;
+    }
+    const req = buildLoadRequest(url, positionMs || 0, playing !== false, statusCustomData());
+    console.log('[cue-receiver] loadStream', reason, url.slice(0, 64), 'pos=' + positionMs);
+    playerManager.load(req).then(function () {
+      loadingUrl = '';
+      console.log('[cue-receiver] loadStream ok', reason);
+    }).catch(function (err) {
+      loadingUrl = '';
+      console.warn('[cue-receiver] loadStream failed', err);
+    });
+  }
+
+  function preloadNext() {
+    const st = rx.status;
+    if (!st) return;
+    let ti = st.titleIndex;
+    let si = st.sceneIndex + 1;
+    const scenes = (rx.playlist[ti] && rx.playlist[ti].scenes) || [];
+    if (si >= scenes.length) { ti += 1; si = 0; }
+    if (ti >= rx.playlist.length) return;
+    const url = urlForTitleIndex(ti);
+    if (!isHttpUrl(url) || url === currentStreamUrl) return;
+    try {
+      const nextScene = sceneAt(ti, si);
+      const req = buildLoadRequest(url, nextScene ? nextScene.startMs : 0, false, null);
+      playerManager.preload(req);
+      console.log('[cue-receiver] preload next title', ti, url.slice(0, 48));
+    } catch (e) {
+      console.warn('[cue-receiver] preload failed', e);
+    }
+  }
+
+  function goToClip(ti, si, positionMs, playing, reason) {
+    if (ti < 0 || ti >= rx.playlist.length) return;
+    const scenes = rx.playlist[ti].scenes || [];
+    if (!scenes.length) return;
+    si = Math.max(0, Math.min(si, scenes.length - 1));
+    const scene = scenes[si];
+    const start = Number(scene.startMs) || 0;
+    const end = Number(scene.endMs) || (start + 30000);
+    let pos = positionMs != null ? Number(positionMs) : start;
+    if (pos < start || pos >= end) pos = start;
+
+    const status = makeStatus({
+      clipId: clipIdOf(scene),
+      titleIndex: ti,
+      sceneIndex: si,
+      positionMs: pos,
+      playing: playing !== false,
+      rate: 1,
+      atElapsedMs: nowElapsed(),
+    });
+    rx.status = status;
+    broadcastStatus(status, reason || 'goto');
+    renderUi();
+    showOverlayTransient();
+
+    const url = urlForTitleIndex(ti) ||
+      (rx.playlist[ti] && urlByRatingKey[rx.playlist[ti].ratingKey]) || '';
+    if (isHttpUrl(url)) {
+      loadStream(url, pos, playing !== false, reason || 'goto');
+    } else if (currentStreamUrl && rx.playlist[ti] &&
+        Object.keys(urlByRatingKey).some(function (k) {
+          return urlByRatingKey[k] === currentStreamUrl && k === rx.playlist[ti].ratingKey;
+        })) {
+      loadStream(currentStreamUrl, pos, playing !== false, reason || 'goto');
+    } else {
+      console.log('[cue-receiver] waiting for stream URL for',
+        (rx.playlist[ti] && rx.playlist[ti].ratingKey) || ti);
+      renderUi();
+    }
+    preloadNext();
+  }
+
+  function advance(deltaTitle, deltaScene, reason) {
+    if (!rx.status || !rx.playlist.length) return;
+    let ti = rx.status.titleIndex || 0;
+    let si = rx.status.sceneIndex || 0;
+    if (deltaScene) {
+      si += deltaScene;
+      const scenes = (rx.playlist[ti] && rx.playlist[ti].scenes) || [];
+      if (si >= scenes.length) {
+        if (ti + 1 < rx.playlist.length) { ti += 1; si = 0; }
+        else { si = scenes.length - 1; }
+      } else if (si < 0) {
+        if (ti > 0) {
+          ti -= 1;
+          si = Math.max(0, ((rx.playlist[ti].scenes || []).length - 1));
+        } else {
+          si = 0;
+        }
+      }
+    }
+    if (deltaTitle) {
+      ti = Math.max(0, Math.min(ti + deltaTitle, rx.playlist.length - 1));
+      si = 0;
+    }
+    const scene = sceneAt(ti, si);
+    goToClip(ti, si, scene ? scene.startMs : 0, true, reason || 'nav');
+  }
+
+  function enforceClipWindow() {
+    if (advancing || !rx.status || !rx.status.playing) return;
+    const scene = sceneAt(rx.status.titleIndex, rx.status.sceneIndex);
+    if (!scene) return;
+    const end = Number(scene.endMs) || 0;
+    if (end <= 0) return;
+    const pos = playerPosMs();
+    rx.status.positionMs = pos;
+    rx.status.atElapsedMs = nowElapsed();
+    renderUi();
+    if (pos >= end - 80) {
+      advancing = true;
+      console.log('[cue-receiver] clip window end', clipIdOf(scene), pos, '>=', end);
+      advance(0, 1, 'clip-end');
+      setTimeout(function () { advancing = false; }, 400);
+    }
+  }
+
+  function startClipWatch() {
+    clearInterval(clipWatchTimer);
+    clipWatchTimer = setInterval(enforceClipWindow, 250);
+  }
+
+  // ---- Apply CastSync intents ----
+  function applyMessage(msg, reason) {
+    if (!shouldApply(msg)) {
+      console.log('[cue-receiver] ignore', reason, msg && msg.type, msg && msg.origin, msg && msg.seq);
+      return null;
+    }
+    markApplied(msg);
+    const at = nowElapsed();
+
+    switch (msg.type) {
+      case TYPE.PLAYLIST: {
+        rememberUrlsFromTitles(msg.titles);
+        rx.playlist = mergePlaylistByRatingKey(rx.playlist, msg.titles);
+        rx.kind = msg.kind || rx.kind;
+        rx.prompt = msg.prompt || rx.prompt;
+        rx.playlistAdopted = true;
+
+        let ti = 0;
+        let si = 0;
+        const found = findByClipId(msg.clipId);
+        if (found) {
+          ti = found.ti;
+          si = found.si;
+        } else {
+          let cand = msg.titleIndex;
+          if (cand < 0 || cand >= rx.playlist.length) {
+            cand = msg.titleIndex - (msg.windowStart || 0);
+          }
+          cand = Math.max(0, Math.min(cand, Math.max(0, rx.playlist.length - 1)));
+          const scenes = (rx.playlist[cand] && rx.playlist[cand].scenes) || [];
+          ti = cand;
+          si = Math.max(0, Math.min(msg.sceneIndex || 0, Math.max(0, scenes.length - 1)));
+        }
+        const scene = sceneAt(ti, si);
+        const status = makeStatus({
+          clipId: clipIdOf(scene),
+          titleIndex: ti,
+          sceneIndex: si,
+          positionMs: msg.positionMs || (scene ? scene.startMs : 0),
+          playing: msg.playing !== false,
+          rate: 1,
+          atElapsedMs: at,
+        });
+        rx.status = status;
+        broadcastStatus(status, reason || 'playlist');
+        renderUi();
+        return { ti: ti, si: si, positionMs: status.positionMs, playing: status.playing, clipId: status.clipId };
+      }
+      case TYPE.GOTO: {
+        const found = findByClipId(msg.clipId);
+        if (!found) {
+          console.log('[cue-receiver] goto unknown clip', msg.clipId);
+          return null;
+        }
+        goToClip(found.ti, found.si, msg.positionMs, rx.status ? rx.status.playing : true, 'goto');
+        return null;
+      }
+      case TYPE.PLAY: {
+        if (!rx.status) return null;
+        rx.status = makeStatus({
+          clipId: rx.status.clipId,
+          titleIndex: rx.status.titleIndex,
+          sceneIndex: rx.status.sceneIndex,
+          positionMs: extrapolate(rx.status, at),
+          playing: true,
+          rate: 1,
+          atElapsedMs: at,
+        });
+        broadcastStatus(rx.status, 'play');
+        playMedia();
+        renderUi();
+        return null;
+      }
+      case TYPE.PAUSE: {
+        if (!rx.status) return null;
+        rx.status = makeStatus({
+          clipId: rx.status.clipId,
+          titleIndex: rx.status.titleIndex,
+          sceneIndex: rx.status.sceneIndex,
+          positionMs: extrapolate(rx.status, at),
+          playing: false,
+          rate: 1,
+          atElapsedMs: at,
+        });
+        broadcastStatus(rx.status, 'pause');
+        pauseMedia();
+        showOverlayTransient();
+        renderUi();
+        return null;
+      }
+      case TYPE.SEEK: {
+        if (!rx.status) return null;
+        const scene = sceneAt(rx.status.titleIndex, rx.status.sceneIndex);
+        const start = scene ? Number(scene.startMs) || 0 : 0;
+        const end = scene ? Number(scene.endMs) || (start + 30000) : start + 30000;
+        let pos = Number(msg.positionMs) || start;
+        pos = Math.max(start, Math.min(pos, end - 1));
+        rx.status = makeStatus({
+          clipId: rx.status.clipId,
+          titleIndex: rx.status.titleIndex,
+          sceneIndex: rx.status.sceneIndex,
+          positionMs: pos,
+          playing: rx.status.playing,
+          rate: 1,
+          atElapsedMs: at,
+        });
+        broadcastStatus(rx.status, 'seek');
+        seekToMs(pos);
+        showOverlayTransient();
+        renderUi();
+        return null;
+      }
+      case TYPE.STATUS: {
+        rx.status = makeStatus({
+          clipId: msg.clipId,
+          titleIndex: msg.titleIndex,
+          sceneIndex: msg.sceneIndex,
+          positionMs: msg.positionMs,
+          playing: msg.playing,
+          rate: msg.rate || 1,
+          atElapsedMs: at,
+        });
+        broadcastStatus(rx.status, 'peer-status');
+        renderUi();
+        return null;
+      }
+      default:
+        return null;
+    }
+  }
+
+  // ---- CAF interceptors ----
+  // LOAD: adopt playlist from customData; only load real stream URLs.
+  // Play/pause/seek must NOT re-LOAD media.
+  playerManager.setMessageInterceptor(
+    cast.framework.messages.MessageType.LOAD,
+    function (loadRequestData) {
+      const custom = (loadRequestData && loadRequestData.customData) ||
+        (loadRequestData && loadRequestData.media && loadRequestData.media.customData) ||
+        null;
+      const contentId = loadRequestData && loadRequestData.media && loadRequestData.media.contentId;
+      const msg = parseMessage(custom);
+
+      if (msg && msg.type === TYPE.PLAYLIST) {
+        const applied = applyMessage(msg, 'LOAD');
+        if (isHttpUrl(contentId)) {
+          const st = rx.status;
+          if (st) {
+            const t = rx.playlist[st.titleIndex];
+            if (t && t.ratingKey) urlByRatingKey[t.ratingKey] = contentId;
+          }
+          // Same stream already playing → seek/play via CAF, reject duplicate LOAD.
+          if (currentStreamUrl && contentId === currentStreamUrl && rx.playlistAdopted) {
+            const pos = applied ? applied.positionMs : (loadRequestData.currentTime || 0) * 1000;
+            const playing = applied ? applied.playing : loadRequestData.autoplay !== false;
+            seekToMs(pos);
+            if (playing) playMedia(); else pauseMedia();
+            if (loadRequestData.media) loadRequestData.media.customData = statusCustomData();
+            loadRequestData.customData = statusCustomData();
+            console.log('[cue-receiver] LOAD same URL → seek/play, no reload');
+            return null;
+          }
+          currentStreamUrl = contentId;
+          loadingUrl = contentId;
+          if (applied) {
+            loadRequestData.currentTime = (applied.positionMs || 0) / 1000;
+            loadRequestData.autoplay = applied.playing !== false;
+          }
+          if (loadRequestData.media) loadRequestData.media.customData = statusCustomData();
+          loadRequestData.customData = statusCustomData();
+          return loadRequestData;
+        }
+        // contentId is clipId / non-URL: rewrite to known stream or wait.
+        const st = rx.status;
+        const url = (st && urlForTitleIndex(st.titleIndex)) || currentStreamUrl;
+        if (isHttpUrl(url)) {
+          if (url === currentStreamUrl) {
+            const pos = applied ? applied.positionMs : playerPosMs();
+            seekToMs(pos);
+            if (!applied || applied.playing) playMedia(); else pauseMedia();
+            return null;
+          }
+          loadRequestData.media.contentId = url;
+          loadRequestData.media.contentType = guessMime(url);
+          if (applied) {
+            loadRequestData.currentTime = (applied.positionMs || 0) / 1000;
+            loadRequestData.autoplay = applied.playing !== false;
+          }
+          loadRequestData.media.customData = statusCustomData();
+          loadRequestData.customData = statusCustomData();
+          currentStreamUrl = url;
+          return loadRequestData;
+        }
+        console.log('[cue-receiver] LOAD playlist without stream URL — UI wait');
+        renderUi();
+        return null;
+      }
+
+      if (isHttpUrl(contentId)) {
+        currentStreamUrl = contentId;
+        return loadRequestData;
+      }
+      console.log('[cue-receiver] reject LOAD without URL/playlist', contentId);
+      return null;
+    }
+  );
+
+  playerManager.setMessageInterceptor(
+    cast.framework.messages.MessageType.PLAY,
+    function (data) {
+      if (rx.status) {
+        const at = nowElapsed();
+        rx.status = makeStatus({
+          clipId: rx.status.clipId,
+          titleIndex: rx.status.titleIndex,
+          sceneIndex: rx.status.sceneIndex,
+          positionMs: extrapolate(rx.status, at),
+          playing: true,
+          atElapsedMs: at,
+        });
+        broadcastStatus(rx.status, 'caf-play');
+        renderUi();
+      }
+      return data;
+    }
+  );
+
+  playerManager.setMessageInterceptor(
+    cast.framework.messages.MessageType.PAUSE,
+    function (data) {
+      if (rx.status) {
+        const at = nowElapsed();
+        rx.status = makeStatus({
+          clipId: rx.status.clipId,
+          titleIndex: rx.status.titleIndex,
+          sceneIndex: rx.status.sceneIndex,
+          positionMs: extrapolate(rx.status, at),
+          playing: false,
+          atElapsedMs: at,
+        });
+        broadcastStatus(rx.status, 'caf-pause');
+        showOverlayTransient();
+        renderUi();
+      }
+      return data;
+    }
+  );
+
+  playerManager.setMessageInterceptor(
+    cast.framework.messages.MessageType.SEEK,
+    function (seekData) {
+      if (rx.status && seekData) {
+        const scene = sceneAt(rx.status.titleIndex, rx.status.sceneIndex);
+        const start = scene ? Number(scene.startMs) || 0 : 0;
+        const end = scene ? Number(scene.endMs) || (start + 30000) : start + 30000;
+        let pos = Math.round((seekData.currentTime || 0) * 1000);
+        pos = Math.max(start, Math.min(pos, end - 1));
+        seekData.currentTime = pos / 1000;
+        const at = nowElapsed();
+        rx.status = makeStatus({
+          clipId: rx.status.clipId,
+          titleIndex: rx.status.titleIndex,
+          sceneIndex: rx.status.sceneIndex,
+          positionMs: pos,
+          playing: rx.status.playing,
+          atElapsedMs: at,
+        });
+        broadcastStatus(rx.status, 'caf-seek');
+        showOverlayTransient();
+        renderUi();
+      }
+      return seekData;
+    }
+  );
+
+  playerManager.setMessageInterceptor(
+    cast.framework.messages.MessageType.MEDIA_STATUS,
+    function (status) {
+      if (rx.status) {
+        status.customData = statusCustomData();
+        if (status.items && status.items[0] && status.items[0].media) {
+          status.items[0].media.customData = statusCustomData();
+        }
+      }
+      return status;
+    }
+  );
+
+  playerManager.setMessageInterceptor(
+    cast.framework.messages.MessageType.QUEUE_UPDATE,
+    function (data) {
+      const jump = data && data.jump;
+      if (jump > 0) advance(0, 1, 'queue-next');
+      else if (jump < 0) advance(0, -1, 'queue-prev');
+      return null;
+    }
+  );
+
+  playerManager.addEventListener(cast.framework.events.EventType.PLAYER_LOAD_COMPLETE, function () {
+    loadingUrl = '';
+    if (rx.status && rx.status.playing) playMedia();
+    startClipWatch();
+    preloadNext();
+    emitPlaybackStatus('load-complete');
+  });
+
+  playerManager.addEventListener(cast.framework.events.EventType.MEDIA_FINISHED, function () {
+    advance(0, 1, 'media-finished');
+  });
+
+  playerManager.addEventListener(cast.framework.events.EventType.MEDIA_STATUS, function () {
+    emitPlaybackStatus('media-status');
+  });
+
+  context.addCustomMessageListener(NAMESPACE, function (event) {
+    const msg = parseMessage(event.data);
+    if (!msg) return;
+    if (msg.type === TYPE.PLAYLIST) {
+      const applied = applyMessage(msg, 'custom-playlist');
+      if (applied) {
+        const url = urlForTitleIndex(applied.ti) || currentStreamUrl;
+        if (isHttpUrl(url)) loadStream(url, applied.positionMs, applied.playing, 'custom-playlist');
+        else renderUi();
+      }
+      return;
+    }
+    if (msg.type === TYPE.GOTO) {
+      applyMessage(msg, 'custom-goto');
+      return;
+    }
+    applyMessage(msg, 'custom-' + msg.type);
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (!rx.playlist.length) return;
+    switch (e.key) {
+      case 'ArrowDown':
+      case 'MediaTrackNext':
+        advance(1, 0, 'dpad-down');
+        break;
+      case 'ArrowUp':
+      case 'MediaTrackPrevious':
+        advance(-1, 0, 'dpad-up');
+        break;
+      case 'ArrowRight':
+        advance(0, 1, 'dpad-right');
+        break;
+      case 'ArrowLeft':
+        advance(0, -1, 'dpad-left');
+        break;
+      case 'Enter':
+      case 'MediaPlayPause':
+      case ' ':
+        if (rx.status) {
+          const at = nowElapsed();
+          const playing = !rx.status.playing;
+          rx.status = makeStatus({
+            clipId: rx.status.clipId,
+            titleIndex: rx.status.titleIndex,
+            sceneIndex: rx.status.sceneIndex,
+            positionMs: extrapolate(rx.status, at),
+            playing: playing,
+            atElapsedMs: at,
+          });
+          broadcastStatus(rx.status, playing ? 'remote-play' : 'remote-pause');
+          if (playing) playMedia(); else pauseMedia();
+          renderUi();
+        }
+        showOverlayTransient();
+        break;
+      default:
+        showOverlayTransient();
+        break;
+    }
+  });
+
+  document.addEventListener('pointerdown', function () { showOverlayTransient(); });
+
+  context.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, function () {
+    if (rx.epoch === 0) beginSession();
+    if (rx.status) broadcastStatus(rx.status, 'sender-connected');
+  });
+
+  context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, function () {
+    try {
+      const senders = context.getSenders() || [];
+      if (senders.length === 0) {
+        rx.lastSeqByOrigin = Object.create(null);
+      }
+    } catch (e) {}
+  });
+
+  const options = new cast.framework.CastReceiverOptions();
+  options.customNamespaces = Object.assign({}, options.customNamespaces || {}, {
+    [NAMESPACE]: cast.framework.system.MessageType.JSON,
+  });
+  options.maxInactivity = 3600;
+  options.disableIdleTimeout = true;
+
+  beginSession();
+  context.start(options);
+  startClipWatch();
+  console.log('[cue-receiver] started App ID 30917C87 — CAF-bound #media via setMediaElement, CastSync v2, origin=' + SELF);
+})();
   </script>
 </body>
 </html>
