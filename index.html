@@ -164,6 +164,10 @@
   // CastSync v2 protocol — mirror of CastSync.kt (receiver is authority).
   const NAMESPACE = 'urn:x-cast:com.efraimbart.cue.shorts';
   const SELF = 'web';
+  const MAX_SANE_POSITION_MS = 12 * 60 * 60 * 1000; // 12h — reject elapsedRealtime leaks
+  const STATUS_HEARTBEAT_MS = 10000;
+  const STATUS_POSITION_SLACK_MS = 1500;
+
   const TYPE = {
     PLAYLIST: 'playlist',
     GOTO: 'goto',
@@ -171,6 +175,8 @@
     PAUSE: 'pause',
     SEEK: 'seek',
     STATUS: 'status',
+    MEDIA_ERROR: 'mediaError',
+    RESYNC: 'resync',
   };
 
   const el = {
@@ -367,6 +373,18 @@
           rate: Number(raw.rate) || 1,
           atElapsedMs: Number(raw.atElapsedMs) || 0,
         });
+      case TYPE.RESYNC:
+        return Object.assign(base, {
+          reason: String(raw.reason || ''),
+          clipId: String(raw.clipId || ''),
+        });
+      case TYPE.MEDIA_ERROR:
+        return Object.assign(base, {
+          clipId: String(raw.clipId || ''),
+          errorCode: String(raw.errorCode || ''),
+          errorDetail: String(raw.errorDetail || ''),
+          contentId: String(raw.contentId || ''),
+        });
       default:
         return null;
     }
@@ -430,27 +448,43 @@
     return status.positionMs + Math.round(dt * status.rate);
   }
 
-  function statusIfChanged(partial, slackMs) {
-    slackMs = slackMs == null ? 400 : slackMs;
+  function clampPosition(clipId, positionMs) {
+    const found = findByClipId(clipId);
+    const scene = found ? sceneAt(found.ti, found.si) : null;
+    const start = scene ? (Number(scene.startMs) || 0) : 0;
+    const end = scene && Number(scene.endMs) > start ? Number(scene.endMs) : start + 120000;
+    const endCap = Math.max(start, end - 500);
+    let pos = Number(positionMs) || 0;
+    if (pos > MAX_SANE_POSITION_MS || (scene && pos > end + 60000)) pos = start;
+    if (pos < start) pos = start;
+    if (pos > endCap) pos = endCap;
+    return pos;
+  }
+
+  function statusIfChanged(partial, slackMs, heartbeatMs) {
+    slackMs = slackMs == null ? STATUS_POSITION_SLACK_MS : slackMs;
+    heartbeatMs = heartbeatMs == null ? STATUS_HEARTBEAT_MS : heartbeatMs;
     const cur = rx.status;
     const next = {
       clipId: partial.clipId,
       titleIndex: partial.titleIndex,
       sceneIndex: partial.sceneIndex,
-      positionMs: partial.positionMs,
+      positionMs: clampPosition(partial.clipId, partial.positionMs),
       playing: partial.playing,
       rate: partial.rate != null ? partial.rate : 1,
     };
+    const at = nowElapsed();
     if (cur &&
         cur.clipId === next.clipId &&
         cur.titleIndex === next.titleIndex &&
         cur.sceneIndex === next.sceneIndex &&
         cur.playing === next.playing &&
-        Math.abs((cur.rate || 1) - next.rate) < 0.01 &&
-        Math.abs(extrapolate(cur, nowElapsed()) - next.positionMs) <= slackMs) {
-      return null;
+        Math.abs((cur.rate || 1) - next.rate) < 0.01) {
+      const posDelta = Math.abs(extrapolate(cur, at) - next.positionMs);
+      const age = at - (cur.atElapsedMs || 0);
+      if (posDelta <= slackMs && age < heartbeatMs) return null;
     }
-    const s = makeStatus(Object.assign({}, next, { atElapsedMs: nowElapsed() }));
+    const s = makeStatus(Object.assign({}, next, { atElapsedMs: at }));
     rx.status = s;
     return s;
   }
@@ -801,7 +835,10 @@
     switch (msg.type) {
       case TYPE.PLAYLIST: {
         rememberUrlsFromTitles(msg.titles);
-        rx.playlist = mergePlaylistByRatingKey(rx.playlist, msg.titles);
+        // First playlist → REPLACE; later windows merge by ratingKey.
+        rx.playlist = (!rx.playlist || !rx.playlist.length)
+          ? (msg.titles || []).slice()
+          : mergePlaylistByRatingKey(rx.playlist, msg.titles);
         rx.kind = msg.kind || rx.kind;
         rx.prompt = msg.prompt || rx.prompt;
         rx.playlistAdopted = true;
@@ -812,7 +849,7 @@
         if (found) {
           ti = found.ti;
           si = found.si;
-        } else {
+        } else if (!msg.clipId) {
           let cand = msg.titleIndex;
           if (cand < 0 || cand >= rx.playlist.length) {
             cand = msg.titleIndex - (msg.windowStart || 0);
@@ -823,11 +860,18 @@
           si = Math.max(0, Math.min(msg.sceneIndex || 0, Math.max(0, scenes.length - 1)));
         }
         const scene = sceneAt(ti, si);
+        const clip = clipIdOf(scene);
+        const first3 = [];
+        for (let i = 0; i < rx.playlist.length && first3.length < 3; i++) {
+          const scs = rx.playlist[i].scenes || [];
+          for (let j = 0; j < scs.length && first3.length < 3; j++) first3.push(clipIdOf(scs[j]));
+        }
+        console.log('[cue-receiver] ASSERT on-screen firstClips=' + first3.join(','));
         const status = makeStatus({
-          clipId: clipIdOf(scene),
+          clipId: clip,
           titleIndex: ti,
           sceneIndex: si,
-          positionMs: msg.positionMs || (scene ? scene.startMs : 0),
+          positionMs: clampPosition(clip, msg.positionMs || (scene ? scene.startMs : 0)),
           playing: msg.playing !== false,
           rate: 1,
           atElapsedMs: at,
@@ -837,13 +881,30 @@
         renderUi();
         return { ti: ti, si: si, positionMs: status.positionMs, playing: status.playing, clipId: status.clipId };
       }
+      case TYPE.RESYNC: {
+        console.log('[cue-receiver] resync requested', msg.reason, msg.clipId);
+        if (!rx.playlist.length || !rx.status) return null;
+        const st = makeStatus({
+          clipId: rx.status.clipId,
+          titleIndex: rx.status.titleIndex,
+          sceneIndex: rx.status.sceneIndex,
+          positionMs: clampPosition(rx.status.clipId, rx.status.positionMs),
+          playing: rx.status.playing,
+          rate: rx.status.rate || 1,
+          atElapsedMs: at,
+        });
+        rx.status = st;
+        broadcastStatus(st, 'resync');
+        // Phone will also re-LOAD playlist; we just refresh status.
+        return null;
+      }
       case TYPE.GOTO: {
         const found = findByClipId(msg.clipId);
         if (!found) {
           console.log('[cue-receiver] goto unknown clip', msg.clipId);
           return null;
         }
-        goToClip(found.ti, found.si, msg.positionMs, rx.status ? rx.status.playing : true, 'goto');
+        goToClip(found.ti, found.si, clampPosition(msg.clipId, msg.positionMs), rx.status ? rx.status.playing : true, 'goto');
         return null;
       }
       case TYPE.PLAY: {
