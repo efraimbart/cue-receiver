@@ -185,6 +185,9 @@
   const HLS_ENABLED = false;
   const DEFAULT_STALL_MS = 8000;
   let ladder = null; // { clipId, steps, idx, startedAt, reported, meta, stallTimer, loadGen, advancing }
+  /** v3.5.62 C2: when true, media timeline is 0-based (remux URL already applied offset). */
+  let relativeTimeline = false;
+  let relativeStartMs = 0;
   /** Last ladder customData from the phone (survives goto intents that omit remuxUrl). */
   let lastLadderCustom = null;
 
@@ -616,7 +619,12 @@
   function playerPosMs() {
     try {
       const sec = playerManager.getCurrentTimeSec();
-      if (typeof sec === 'number' && !isNaN(sec)) return Math.round(sec * 1000);
+      if (typeof sec === 'number' && !isNaN(sec)) {
+        const relative = Math.round(sec * 1000);
+        // v3.5.62 C2: remux/start.mp4 timeline starts at 0 after URL offset — report absolute file time.
+        if (relativeTimeline) return relativeStartMs + relative;
+        return relative;
+      }
     } catch (e) {}
     return rx.status ? rx.status.positionMs : 0;
   }
@@ -790,8 +798,20 @@
     if (customData) mediaInfo.customData = customData;
     const req = new cast.framework.messages.LoadRequestData();
     req.media = mediaInfo;
-    // Absolute file time via currentTime (no Shaka offset).
-    req.currentTime = Math.max(0, (startMs || 0) / 1000);
+    // v3.5.62 C2: remux/start.mp4 already seeks via ?offset= — timeline is 0-based.
+    // Seeking to absolute startMs (e.g. 220) then clampPosition'd reports back as frozen start.
+    const isRemux = /\/transcode\/universal\/start\.mp4/.test(url || '') ||
+      (contentType === 'video/mp4' && /directStream=1/.test(url || ''));
+    const scene = rx.status ? sceneAt(rx.status.titleIndex, rx.status.sceneIndex) : null;
+    const sceneStart = scene ? (Number(scene.startMs) || 0) : 0;
+    relativeTimeline = !!isRemux;
+    relativeStartMs = sceneStart;
+    if (isRemux) {
+      const abs = Math.max(0, Number(startMs) || 0);
+      req.currentTime = Math.max(0, (abs - sceneStart) / 1000);
+    } else {
+      req.currentTime = Math.max(0, (startMs || 0) / 1000);
+    }
     req.autoplay = autoplay !== false;
     if (customData) req.customData = customData;
     return req;
