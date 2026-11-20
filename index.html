@@ -181,10 +181,12 @@
     CAF_PLAY: 'cafPlay',
   };
 
-  // v3.5.60 progressive ladder: 1=direct part, 2=HTTP MP4 remux, 3=HLS (disabled until CORS fix).
+  // v3.5.61 progressive ladder: 1=direct part, 2=HTTP MP4 remux, 3=HLS (disabled until CORS fix).
   const HLS_ENABLED = false;
   const DEFAULT_STALL_MS = 8000;
-  let ladder = null; // { clipId, steps, idx, startedAt, reported, meta, stallTimer, loadGen }
+  let ladder = null; // { clipId, steps, idx, startedAt, reported, meta, stallTimer, loadGen, advancing }
+  /** Last ladder customData from the phone (survives goto intents that omit remuxUrl). */
+  let lastLadderCustom = null;
 
   const el = {
     media: document.getElementById('media'),
@@ -686,6 +688,27 @@
     }
   }
 
+  function deviceModelString() {
+    // Never use cast.__platform__ — it is a huge object (PortConnector/…) and poisons prefs keys.
+    try {
+      const ua = (navigator && navigator.userAgent) || '';
+      if (/Chromecast/i.test(ua)) return 'chromecast';
+      if (/CrKey/i.test(ua)) return 'chromecast';
+      if (/GoogleTV|Android TV/i.test(ua)) return 'google-tv';
+    } catch (e) {}
+    return 'chromecast';
+  }
+
+  function mergeLadderCustom(custom, fallbackUrl) {
+    const base = Object.assign({}, lastLadderCustom || {}, custom || {});
+    if (!isHttpUrl(base.directUrl) && isHttpUrl(fallbackUrl)) base.directUrl = fallbackUrl;
+    if (!isHttpUrl(base.streamUrl) && isHttpUrl(fallbackUrl)) base.streamUrl = fallbackUrl;
+    if (isHttpUrl(base.directUrl) || isHttpUrl(base.remuxUrl) || isHttpUrl(base.streamUrl)) {
+      lastLadderCustom = base;
+    }
+    return base;
+  }
+
   function emitCafPlay(step, result, ttffMs, contentType) {
     if (!ladder || ladder.reported) return;
     ladder.reported = true;
@@ -707,7 +730,7 @@
       width: meta.width || 0,
       height: meta.height || 0,
       contentType: contentType || '',
-      deviceModel: (cast && cast.__platform__) || 'chromecast',
+      deviceModel: deviceModelString(),
     };
     try {
       context.sendCustomMessage(NAMESPACE, undefined, payload);
@@ -718,20 +741,21 @@
   }
 
   function buildStepsFromCustom(custom, fallbackUrl) {
+    const merged = mergeLadderCustom(custom, fallbackUrl);
     const meta = {
-      container: String((custom && custom.container) || ''),
-      videoCodec: String((custom && custom.videoCodec) || ''),
-      audioCodec: String((custom && custom.audioCodec) || ''),
-      width: Number((custom && custom.width) || 0) || 0,
-      height: Number((custom && custom.height) || 0) || 0,
-      stallMs: Number((custom && custom.stallMs) || DEFAULT_STALL_MS) || DEFAULT_STALL_MS,
+      container: String(merged.container || ''),
+      videoCodec: String(merged.videoCodec || ''),
+      audioCodec: String(merged.audioCodec || ''),
+      width: Number(merged.width || 0) || 0,
+      height: Number(merged.height || 0) || 0,
+      stallMs: Number(merged.stallMs || DEFAULT_STALL_MS) || DEFAULT_STALL_MS,
     };
-    const preferred = Number((custom && custom.preferredStep) || 1) || 1;
-    const hlsEnabled = !!(custom && custom.hlsEnabled) && HLS_ENABLED;
-    const direct = isHttpUrl(custom && custom.directUrl) ? custom.directUrl
-      : (isHttpUrl(custom && custom.streamUrl) ? custom.streamUrl : fallbackUrl);
-    const remux = isHttpUrl(custom && custom.remuxUrl) ? custom.remuxUrl : '';
-    const hls = hlsEnabled && isHttpUrl(custom && custom.hlsUrl) ? custom.hlsUrl : '';
+    const preferred = Number(merged.preferredStep || 1) || 1;
+    const hlsEnabled = !!merged.hlsEnabled && HLS_ENABLED;
+    const direct = isHttpUrl(merged.directUrl) ? merged.directUrl
+      : (isHttpUrl(merged.streamUrl) ? merged.streamUrl : fallbackUrl);
+    const remux = isHttpUrl(merged.remuxUrl) ? merged.remuxUrl : '';
+    const hls = hlsEnabled && isHttpUrl(merged.hlsUrl) ? merged.hlsUrl : '';
     const steps = [];
     function add(step, url) {
       if (!isHttpUrl(url)) return;
@@ -749,6 +773,10 @@
     if (hlsEnabled) add(3, hls);
     if (!steps.length && isHttpUrl(fallbackUrl)) {
       add(1, fallbackUrl);
+    }
+    if (steps.length === 1 && !remux) {
+      console.warn('[cue-receiver] ladder has no remuxUrl — step2 unavailable',
+        'direct=', !!direct, 'keys=', Object.keys(merged || {}));
     }
     return { steps: steps, meta: meta };
   }
@@ -783,7 +811,7 @@
   }
 
   function tryNextStep(why) {
-    if (!ladder || ladder.reported) return;
+    if (!ladder || ladder.reported || ladder.advancing) return;
     const failed = ladder.steps[ladder.idx];
     if (!failed) return;
     // Intermediate failure: report only if no more steps; otherwise advance quietly.
@@ -791,11 +819,18 @@
       emitCafPlay(failed.step, why === 'stall' ? 'stall' : ('error:' + why), -1, failed.contentType);
       return;
     }
-    console.log('[cue-receiver] step', failed.step, why, '→ trying next');
+    ladder.advancing = true;
+    console.log('[cue-receiver] step', failed.step, why, '→ trying next',
+      'remux=', !!(ladder.steps[ladder.idx + 1]));
     ladder.idx += 1;
     ladder.startedAt = nowElapsed();
     ladder.reported = false;
-    loadLadderStep('fallback-' + why);
+    // Defer so concurrent error handlers for the failed step do not double-advance.
+    setTimeout(function () {
+      if (!ladder) return;
+      ladder.advancing = false;
+      loadLadderStep('fallback-' + why);
+    }, 30);
   }
 
   function loadLadderStep(reason) {
@@ -805,9 +840,10 @@
     const url = stepInfo.url;
     const positionMs = ladder.positionMs || 0;
     const playing = ladder.playing !== false;
+    const gen = (ladder.loadGen || 0) + 1;
+    ladder.loadGen = gen;
     loadingUrl = url;
     currentStreamUrl = url;
-    ladder.loadGen = (ladder.loadGen || 0) + 1;
     const st = rx.status;
     if (st) {
       const t = rx.playlist[st.titleIndex];
@@ -815,9 +851,10 @@
     }
     const req = buildLoadRequest(url, positionMs, playing, statusCustomData(), stepInfo.contentType);
     console.log('[cue-receiver] loadStep', reason, 'step=' + stepInfo.step, stepInfo.contentType,
-      url.slice(0, 72), 'pos=' + positionMs);
+      url.slice(0, 96), 'pos=' + positionMs, 'steps=' + ladder.steps.map(function (s) { return s.step; }).join('>'));
     armStallWatch();
     playerManager.load(req).then(function () {
+      if (!ladder || ladder.loadGen !== gen) return;
       loadingUrl = '';
       console.log('[cue-receiver] loadStep accepted', reason, 'step=' + stepInfo.step);
       // Seek again after load — progressive media has no Shaka offset param.
@@ -826,13 +863,27 @@
         seekToMs(positionMs);
       }
     }).catch(function (err) {
+      if (!ladder || ladder.loadGen !== gen) return;
       loadingUrl = '';
-      console.warn('[cue-receiver] loadStep failed', reason, err);
+      const detail = (err && (err.message || err.description || err.code)) || err;
+      console.warn('[cue-receiver] loadStep failed', reason, 'step=' + stepInfo.step, detail);
       tryNextStep('load');
     });
   }
 
   function beginLadder(custom, fallbackUrl, positionMs, playing, reason) {
+    const clipId = (custom && custom.clipId) ||
+      (rx.status && rx.status.clipId) || '';
+    // Same clip already climbing the ladder → seek only (goto must not wipe remux step).
+    if (ladder && !ladder.reported && ladder.clipId && clipId && ladder.clipId === clipId &&
+        reason && String(reason).indexOf('goto') >= 0) {
+      ladder.positionMs = positionMs || ladder.positionMs;
+      ladder.playing = playing !== false;
+      seekToMs(ladder.positionMs || 0);
+      if (ladder.playing) playMedia(); else pauseMedia();
+      console.log('[cue-receiver] beginLadder skip reload (same clip ladder active)', clipId);
+      return;
+    }
     const built = buildStepsFromCustom(custom || {}, fallbackUrl);
     if (!built.steps.length) {
       console.log('[cue-receiver] no stream URL yet (' + reason + ') — UI only');
@@ -841,11 +892,12 @@
     }
     clearLadderTimer();
     ladder = {
-      clipId: (rx.status && rx.status.clipId) || (custom && custom.clipId) || '',
+      clipId: clipId,
       steps: built.steps,
       idx: 0,
       startedAt: nowElapsed(),
       reported: false,
+      advancing: false,
       meta: built.meta,
       stallTimer: null,
       loadGen: 0,
@@ -856,16 +908,13 @@
   }
 
   function loadStream(url, positionMs, playing, reason, custom) {
-    if (custom || (ladder && ladder.meta)) {
-      beginLadder(custom || {}, url, positionMs, playing, reason);
-      return;
-    }
-    if (!isHttpUrl(url)) {
+    const merged = mergeLadderCustom(custom || lastLadderCustom || {}, url);
+    if (!isHttpUrl(url) && !isHttpUrl(merged.directUrl) && !isHttpUrl(merged.remuxUrl)) {
       console.log('[cue-receiver] no stream URL yet (' + reason + ') — UI only');
       renderUi();
       return;
     }
-    beginLadder({ directUrl: url, preferredStep: 1 }, url, positionMs, playing, reason);
+    beginLadder(merged, url, positionMs, playing, reason);
   }
 
   function preloadNext() {
@@ -915,13 +964,20 @@
 
     const url = urlForTitleIndex(ti) ||
       (rx.playlist[ti] && urlByRatingKey[rx.playlist[ti].ratingKey]) || '';
+    // Always pass lastLadderCustom so goto cannot drop remuxUrl / codecs.
+    const ladderCustom = Object.assign({}, lastLadderCustom || {}, {
+      clipId: clipIdOf(scene),
+    });
     if (isHttpUrl(url)) {
-      loadStream(url, pos, playing !== false, reason || 'goto');
+      loadStream(url, pos, playing !== false, reason || 'goto', ladderCustom);
     } else if (currentStreamUrl && rx.playlist[ti] &&
         Object.keys(urlByRatingKey).some(function (k) {
           return urlByRatingKey[k] === currentStreamUrl && k === rx.playlist[ti].ratingKey;
         })) {
-      loadStream(currentStreamUrl, pos, playing !== false, reason || 'goto');
+      loadStream(currentStreamUrl, pos, playing !== false, reason || 'goto', ladderCustom);
+    } else if (isHttpUrl(ladderCustom.directUrl) || isHttpUrl(ladderCustom.remuxUrl)) {
+      loadStream(ladderCustom.directUrl || ladderCustom.remuxUrl, pos, playing !== false,
+        reason || 'goto', ladderCustom);
     } else {
       console.log('[cue-receiver] waiting for stream URL for',
         (rx.playlist[ti] && rx.playlist[ti].ratingKey) || ti);
