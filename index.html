@@ -219,6 +219,7 @@
     playlistAdopted: false,
     queueId: '',
     version: 0,
+    titleOnlyRk: '', // v3.5.64: ratingKey of the scene-less title on screen ('' = on a clip)
   };
   const ERROR_UNKNOWN_CLIP = 'unknown-clip';
 
@@ -976,10 +977,33 @@
     }
   }
 
+  // v3.5.64: a title whose scenes the phone hasn't loaded yet (like the TV app's title page): show its art, pause
+  // the old clip, publish a title-only status (clipId '') so the phone follows by index and loads the scenes; the
+  // phone's list-only update then lands us on scene 0 (see PLAYLIST navigate=false).
+  function goToTitleOnly(ti, playing, reason) {
+    if (ti < 0 || ti >= rx.playlist.length) return;
+    rx.titleOnlyRk = rx.playlist[ti].ratingKey || '';
+    const status = makeStatus({
+      clipId: '',
+      titleIndex: ti,
+      sceneIndex: 0,
+      positionMs: 0,
+      playing: playing !== false,
+      rate: 1,
+      atElapsedMs: nowElapsed(),
+    });
+    rx.status = status;
+    pauseMedia();
+    broadcastStatus(status, (reason || 'nav') + ' title-only');
+    renderUi();
+    showOverlayTransient();
+  }
+
   function goToClip(ti, si, positionMs, playing, reason) {
     if (ti < 0 || ti >= rx.playlist.length) return;
     const scenes = rx.playlist[ti].scenes || [];
-    if (!scenes.length) return;
+    if (!scenes.length) { goToTitleOnly(ti, playing, reason); return; }
+    rx.titleOnlyRk = '';
     si = Math.max(0, Math.min(si, scenes.length - 1));
     const scene = scenes[si];
     const start = Number(scene.startMs) || 0;
@@ -1096,6 +1120,25 @@
         rx.playlistAdopted = true;
         rx.queueId = msg.queueId || '';
         rx.version = msg.version || 0;
+        // v3.5.64 list-only update while on a title-only page: stay on that title (by ratingKey); once its scenes
+        // arrived, start scene 0 — the TV app's behaviour.
+        if (msg.navigate === false && sameQueue && prev && !prev.clipId && rx.titleOnlyRk) {
+          let idx = -1;
+          for (let i = 0; i < rx.playlist.length; i++) {
+            if (rx.playlist[i].ratingKey === rx.titleOnlyRk) { idx = i; break; }
+          }
+          if (idx >= 0) {
+            const scs = rx.playlist[idx].scenes || [];
+            if (scs.length) {
+              goToClip(idx, 0, null, prev.playing !== false, 'scenes-arrived');
+            } else {
+              rx.status = makeStatus({ clipId: '', titleIndex: idx, sceneIndex: 0, positionMs: 0, playing: prev.playing, atElapsedMs: at });
+              broadcastStatus(rx.status, 'playlist-keep-title v' + rx.version);
+              renderUi();
+            }
+            return null;
+          }
+        }
         // v3.5.63 list-only update of the same queue: keep playing the current clip (re-index, no reload).
         if (msg.navigate === false && sameQueue && prev && prev.clipId) {
           const keep = findByClipId(prev.clipId);
@@ -1133,6 +1176,7 @@
         }
         const scene = sceneAt(ti, si);
         const clip = clipIdOf(scene);
+        rx.titleOnlyRk = clip ? '' : ((rx.playlist[ti] && rx.playlist[ti].ratingKey) || '');
         const first3 = [];
         for (let i = 0; i < rx.playlist.length && first3.length < 3; i++) {
           const scs = rx.playlist[i].scenes || [];
@@ -1276,6 +1320,13 @@
 
       if (msg && msg.type === TYPE.PLAYLIST) {
         const applied = applyMessage(msg, 'LOAD');
+        if (applied && !applied.clipId) {
+          // v3.5.64: phone is on a title whose scenes aren't loaded: never play the whole file from 0.
+          console.log('[cue-receiver] LOAD playlist on title-only page — art, wait for scenes');
+          pauseMedia();
+          renderUi();
+          return null;
+        }
         const pos = applied ? applied.positionMs : ((loadRequestData.currentTime || 0) * 1000);
         const playing = applied ? applied.playing : loadRequestData.autoplay !== false;
         if (hasLadder || isHttpUrl(contentId)) {
@@ -1506,6 +1557,7 @@
     if (!msg) return;
     if (msg.type === TYPE.PLAYLIST) {
       const applied = applyMessage(msg, 'custom-playlist');
+      if (applied && !applied.clipId) { pauseMedia(); renderUi(); return; } // v3.5.64: title-only page
       if (applied) {
         const url = urlForTitleIndex(applied.ti) || currentStreamUrl;
         if (isHttpUrl(url)) loadStream(url, applied.positionMs, applied.playing, 'custom-playlist');
