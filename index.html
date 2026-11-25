@@ -163,6 +163,8 @@
   'use strict';
 
   // CastSync v2 protocol — mirror of CastSync.kt (receiver is authority).
+  // v3.5.63 shared queue: playlist carries queueId/version/navigate (whole phone list); every status
+  // carries ack (highest sender seq applied) + queueId/version so the phone can drop pre-ack history.
   const NAMESPACE = 'urn:x-cast:com.efraimbart.cue.shorts';
   const SELF = 'web';
   const MAX_SANE_POSITION_MS = 12 * 60 * 60 * 1000; // 12h — reject elapsedRealtime leaks
@@ -215,7 +217,10 @@
     prompt: '',
     status: null,
     playlistAdopted: false,
+    queueId: '',
+    version: 0,
   };
+  const ERROR_UNKNOWN_CLIP = 'unknown-clip';
 
   /** ratingKey → last known stream URL (from MediaInfo contentId). */
   const urlByRatingKey = Object.create(null);
@@ -358,6 +363,9 @@
           playing: raw.playing !== false,
           titles: titles,
           windowStart: Number(raw.windowStart) || 0,
+          queueId: String(raw.queueId || ''),
+          version: Number(raw.version) || 0,
+          navigate: raw.navigate !== false,
           clipId: String(raw.clipId || clipIdOf(
             titles[localTi] && titles[localTi].scenes && titles[localTi].scenes[sceneIndex]
           )),
@@ -407,6 +415,8 @@
     rx.outSeq = 0;
     rx.lastSeqByOrigin = Object.create(null);
     rx.status = null;
+    rx.queueId = '';
+    rx.version = 0;
     console.log('[cue-receiver] beginSession epoch=' + rx.epoch);
     return rx.epoch;
   }
@@ -434,9 +444,18 @@
     return rx.outSeq;
   }
 
+  function ackSeq() {
+    let a = 0;
+    Object.keys(rx.lastSeqByOrigin).forEach(function (k) { a = Math.max(a, rx.lastSeqByOrigin[k] || 0); });
+    return a;
+  }
+
   function makeStatus(partial) {
     const cur = rx.status || {};
     return {
+      ack: ackSeq(),
+      queueId: rx.queueId,
+      version: rx.version,
       v: 2,
       type: TYPE.STATUS,
       epoch: rx.epoch,
@@ -1068,11 +1087,33 @@
     switch (msg.type) {
       case TYPE.PLAYLIST: {
         rememberUrlsFromTitles(msg.titles);
-        // Phone window is authority — always REPLACE (never keep Chromecast-local leftovers).
+        const sameQueue = !!msg.queueId && msg.queueId === rx.queueId;
+        const prev = rx.status;
+        // Phone list is authority — always REPLACE (never keep Chromecast-local leftovers).
         rx.playlist = (msg.titles || []).slice();
         rx.kind = msg.kind || rx.kind;
         rx.prompt = msg.prompt || rx.prompt;
         rx.playlistAdopted = true;
+        rx.queueId = msg.queueId || '';
+        rx.version = msg.version || 0;
+        // v3.5.63 list-only update of the same queue: keep playing the current clip (re-index, no reload).
+        if (msg.navigate === false && sameQueue && prev && prev.clipId) {
+          const keep = findByClipId(prev.clipId);
+          if (keep) {
+            rx.status = makeStatus({
+              clipId: prev.clipId,
+              titleIndex: keep.ti,
+              sceneIndex: keep.si,
+              positionMs: clampPosition(prev.clipId, extrapolate(prev, at)),
+              playing: prev.playing,
+              rate: prev.rate || 1,
+              atElapsedMs: at,
+            });
+            broadcastStatus(rx.status, 'playlist-keep v' + rx.version);
+            renderUi();
+            return null;
+          }
+        }
 
         let ti = 0;
         let si = 0;
@@ -1133,6 +1174,14 @@
         const found = findByClipId(msg.clipId);
         if (!found) {
           console.log('[cue-receiver] goto unknown clip', msg.clipId);
+          // v3.5.63: tell the phone (it re-sends the shared queue); stay put, do not store.
+          if (rx.status) {
+            const err = makeStatus({ atElapsedMs: at, positionMs: extrapolate(rx.status, at) });
+            err.errorCode = ERROR_UNKNOWN_CLIP;
+            err.errorDetail = msg.clipId;
+            rx.outSeq = err.seq;
+            broadcastStatus(err, 'goto-unknown');
+          }
           return null;
         }
         goToClip(found.ti, found.si, clampPosition(msg.clipId, msg.positionMs), rx.status ? rx.status.playing : true, 'goto');
